@@ -98,7 +98,7 @@ Run at login writes or removes `~/Library/LaunchAgents/com.mgosal.better-clipboa
 
 ## Permissions
 
-Better Clipboard needs Accessibility permission for automatic paste. It requests that permission on first launch. If permission is still missing, open Settings and click `Request Accessibility Permission`.
+Better Clipboard needs Accessibility permission for automatic paste. On first launch, it shows its own permission window first, then asks macOS for Accessibility permission after that window is visible. If permission is still missing later, open Settings and click `Request Accessibility Permission`.
 
 No special permission is needed to read the clipboard change count. macOS may still show its own clipboard privacy prompts depending on system version and launch context.
 

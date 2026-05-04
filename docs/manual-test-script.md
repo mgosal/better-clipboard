@@ -6,6 +6,7 @@ Use this script for release testing before filing issues.
 
 - [ ] Build the app with `./scripts/build-macos-app.sh`.
 - [ ] Open `dist/Better Clipboard.app`.
+- [ ] Confirm Better Clipboard shows its own permission explanation before macOS opens System Settings or the Accessibility prompt.
 - [ ] Grant Accessibility permission when prompted.
 - [ ] Confirm the 📋 menu bar item appears.
 

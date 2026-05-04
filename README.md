@@ -38,7 +38,7 @@ Open settings from the `⚙` button in the palette or from the 📋 menu bar men
 
 The paste flow works at the app level: Better Clipboard records the previously frontmost application before it shows the palette, reactivates that app after selection, then posts paste. macOS does not expose a general public API for restoring the exact focused text field in another process, but reactivating the previous app usually restores that app's key window and focused control.
 
-Accessibility permission is required for automatic paste. Better Clipboard requests it on first launch and shows a small permission window if it is still missing.
+Accessibility permission is required for automatic paste. On first launch, Better Clipboard shows its own permission window first, then asks macOS for Accessibility permission after that window is visible.
 
 ## Run
 

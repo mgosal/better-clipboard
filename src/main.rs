@@ -55,6 +55,7 @@ const PREVIEW_HEADER_HEIGHT: f32 = 42.0;
 const FOCUS_HIDE_GRACE: Duration = Duration::from_millis(180);
 const CHANGE_COUNT_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 const PASTE_DELAY: Duration = Duration::from_millis(140);
+const PERMISSION_PROMPT_DELAY: Duration = Duration::from_millis(700);
 const COMPACT_HEIGHT: f32 = 286.0;
 const EXPANDED_HEIGHT: f32 = 560.0;
 const SETTINGS_HEIGHT: f32 = 300.0;
@@ -76,9 +77,6 @@ fn main() -> eframe::Result<()> {
         AppSettings::default()
     });
     let needs_permission_onboarding = !accessibility_permission_granted();
-    if needs_permission_onboarding {
-        let _ = request_accessibility_permission();
-    }
 
     let store = Arc::new(Mutex::new(
         HistoryStore::load(settings.history_limit).unwrap_or_else(|err| {
@@ -103,7 +101,11 @@ fn main() -> eframe::Result<()> {
             .with_max_inner_size([620.0, EXPANDED_HEIGHT])
             .with_resizable(false)
             .with_decorations(false)
-            .with_always_on_top()
+            .with_window_level(if needs_permission_onboarding {
+                egui::WindowLevel::Normal
+            } else {
+                egui::WindowLevel::AlwaysOnTop
+            })
             .with_visible(needs_permission_onboarding)
             .with_title(APP_NAME),
         ..Default::default()
@@ -598,6 +600,8 @@ struct BetterClipboardApp {
     settings: AppSettings,
     settings_open: bool,
     permission_onboarding: bool,
+    permission_prompt_after: Option<Instant>,
+    permission_prompt_requested: bool,
     selected: Option<Uuid>,
     status: String,
     textures: std::collections::HashMap<Uuid, TextureHandle>,
@@ -629,6 +633,11 @@ impl BetterClipboardApp {
                 format!("Watching clipboard; tray icon unavailable: {err:#}"),
             ),
         };
+        let status = if permission_onboarding {
+            "Better Clipboard needs Accessibility permission for automatic paste.".to_owned()
+        } else {
+            status
+        };
 
         Self {
             store,
@@ -638,6 +647,8 @@ impl BetterClipboardApp {
             settings,
             settings_open: false,
             permission_onboarding,
+            permission_prompt_after: None,
+            permission_prompt_requested: false,
             selected: None,
             status,
             textures: std::collections::HashMap::new(),
@@ -694,6 +705,9 @@ impl BetterClipboardApp {
         if let Some(command) = egui::ViewportCommand::center_on_screen(ctx) {
             ctx.send_viewport_cmd(command);
         }
+        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+            egui::WindowLevel::AlwaysOnTop,
+        ));
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
     }
@@ -1192,8 +1206,19 @@ impl BetterClipboardApp {
     fn show_permission_onboarding(&mut self, ctx: &egui::Context) {
         if accessibility_permission_granted() {
             self.permission_onboarding = false;
+            self.permission_prompt_after = None;
             self.hide_window(ctx);
             return;
+        }
+
+        if self.permission_prompt_after.is_none() && !self.permission_prompt_requested {
+            self.permission_prompt_after = Some(Instant::now() + PERMISSION_PROMPT_DELAY);
+            self.status =
+                "Better Clipboard will ask macOS for Accessibility permission.".to_owned();
+            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+                egui::WindowLevel::Normal,
+            ));
+            ctx.request_repaint_after(PERMISSION_PROMPT_DELAY);
         }
 
         egui::CentralPanel::default()
@@ -1207,9 +1232,13 @@ impl BetterClipboardApp {
                     ui.label(RichText::new(APP_NAME).strong().size(18.0));
                     ui.add_space(10.0);
                     ui.label("Accessibility permission is needed to paste into the app you were using after choosing a clipboard item.");
+                    ui.add_space(6.0);
+                    ui.label("Better Clipboard will open the macOS permission prompt after this window is visible.");
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
-                        if ui.button("Request Permission").clicked() {
+                        if ui.button("Request Now").clicked() {
+                            self.permission_prompt_after = None;
+                            self.permission_prompt_requested = true;
                             if request_accessibility_permission() {
                                 self.permission_onboarding = false;
                                 self.hide_window(ctx);
@@ -1232,6 +1261,24 @@ impl BetterClipboardApp {
                     ui.label(RichText::new(&self.status).color(muted_text(self.settings.theme)));
                 });
             });
+
+        if self
+            .permission_prompt_after
+            .is_some_and(|prompt_at| Instant::now() >= prompt_at)
+        {
+            self.permission_prompt_after = None;
+            self.permission_prompt_requested = true;
+            self.status = "Opening macOS Accessibility permission prompt.".to_owned();
+            if request_accessibility_permission() {
+                self.permission_onboarding = false;
+                self.hide_window(ctx);
+            } else {
+                self.status =
+                    "Permission requested. Allow Better Clipboard in System Settings, then click Check Again."
+                        .to_owned();
+                ctx.request_repaint_after(Duration::from_millis(500));
+            }
+        }
     }
 }
 
