@@ -49,9 +49,6 @@ const THUMBNAIL_SIZE: f32 = 42.0;
 const PREVIEW_SCALE: f32 = 0.5;
 const PREVIEW_MAX_IMAGE_WIDTH: f32 = 860.0;
 const PREVIEW_MAX_IMAGE_HEIGHT: f32 = 560.0;
-const PREVIEW_MIN_WINDOW_WIDTH: f32 = 280.0;
-const PREVIEW_MIN_WINDOW_HEIGHT: f32 = 220.0;
-const PREVIEW_HEADER_HEIGHT: f32 = 42.0;
 const FOCUS_HIDE_GRACE: Duration = Duration::from_millis(180);
 const CHANGE_COUNT_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 const PASTE_DELAY: Duration = Duration::from_millis(140);
@@ -1483,11 +1480,8 @@ impl BetterClipboardApp {
             return;
         };
 
-        let image_size = preview_image_size(image.width, image.height);
-        let window_size = egui::vec2(
-            (image_size.x + 28.0).max(PREVIEW_MIN_WINDOW_WIDTH),
-            (image_size.y + PREVIEW_HEADER_HEIGHT + 28.0).max(PREVIEW_MIN_WINDOW_HEIGHT),
-        );
+        let image_size = preview_image_size(ctx, image.width, image.height);
+        let window_size = image_size;
 
         if !self.textures.contains_key(&item.id) {
             if let Ok(color_image) = load_color_image(&data_dir.join(&image.path)) {
@@ -1516,41 +1510,17 @@ impl BetterClipboardApp {
                 return PreviewAction::Paste;
             }
 
-            let mut action = PreviewAction::None;
             egui::CentralPanel::default()
-                .frame(
-                    egui::Frame::NONE
-                        .fill(palette_background(theme))
-                        .inner_margin(14),
-                )
+                .frame(egui::Frame::NONE.fill(Color32::TRANSPARENT).inner_margin(0))
                 .show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(format!(
-                            "Image · {} x {}",
-                            image.width, image.height
-                        )));
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("×").on_hover_text("Close").clicked() {
-                                action = PreviewAction::Close;
-                            }
-                        });
-                    });
-                    ui.add_space(8.0);
-
                     if let Some(texture) = &texture {
-                        ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
-                            let (rect, _) =
-                                ui.allocate_exact_size(image_size, egui::Sense::hover());
-                            ui.painter().image(
-                                texture.id(),
-                                rect,
-                                egui::Rect::from_min_max(
-                                    egui::pos2(0.0, 0.0),
-                                    egui::pos2(1.0, 1.0),
-                                ),
-                                Color32::WHITE,
-                            );
-                        });
+                        let (rect, _) = ui.allocate_exact_size(image_size, egui::Sense::hover());
+                        ui.painter().image(
+                            texture.id(),
+                            rect,
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                            Color32::WHITE,
+                        );
                     } else {
                         ui.centered_and_justified(|ui| {
                             ui.label("Preview unavailable");
@@ -1558,7 +1528,7 @@ impl BetterClipboardApp {
                     }
                 });
 
-            action
+            PreviewAction::None
         });
 
         match action {
@@ -1587,6 +1557,7 @@ fn image_preview_viewport_builder(ctx: &egui::Context, size: egui::Vec2) -> egui
         .with_max_inner_size(size)
         .with_resizable(false)
         .with_decorations(false)
+        .with_transparent(true)
         .with_always_on_top()
         .with_active(true)
         .with_title("Better Clipboard Image Preview");
@@ -1620,10 +1591,12 @@ fn image_preview_position(ctx: &egui::Context, size: egui::Vec2) -> Option<egui:
     })
 }
 
-fn preview_image_size(width: usize, height: usize) -> egui::Vec2 {
+fn preview_image_size(ctx: &egui::Context, width: usize, height: usize) -> egui::Vec2 {
     let width = width.max(1) as f32;
     let height = height.max(1) as f32;
-    let scaled = egui::vec2(width * PREVIEW_SCALE, height * PREVIEW_SCALE);
+    let pixels_per_point = ctx.pixels_per_point().max(1.0);
+    let native_size = egui::vec2(width / pixels_per_point, height / pixels_per_point);
+    let scaled = native_size * PREVIEW_SCALE;
     let cap_scale = (PREVIEW_MAX_IMAGE_WIDTH / scaled.x)
         .min(PREVIEW_MAX_IMAGE_HEIGHT / scaled.y)
         .min(1.0);

@@ -80,7 +80,7 @@ Use this script for release testing before filing issues.
 
 - [ ] Select an image item.
 - [ ] Press `Right Arrow`.
-- [ ] Confirm a floating preview opens next to the palette.
+- [ ] Confirm an image-only floating preview opens next to the palette at about 50% display size.
 - [ ] Press `Escape` and confirm only the preview closes.
 - [ ] Open the preview again and press `Enter`.
 - [ ] Confirm the preview and palette close, then the image is pasted into the original app.
