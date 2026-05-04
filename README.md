@@ -25,6 +25,7 @@ macOS does not expose an event queue of past clipboard contents, so very rapid c
 - `Up` / `Down`: expand the list and move selection.
 - `Right Arrow`: preview the selected image item; press again for 100% scale.
 - `Left Arrow`: step the image preview back from 100% to 50%, or close it from 50%.
+- `C`: copy the selected item without pasting.
 - `O`: open the selected URL, file path, email address, or phone number.
 - `F`: reveal the selected file path in Finder.
 - `S`: copy the selected item so it is ready to share.

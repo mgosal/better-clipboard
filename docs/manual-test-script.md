@@ -22,7 +22,8 @@ Use this script for release testing before filing issues.
 - [ ] Confirm all copied items appear in newest-first order.
 - [ ] Confirm text, URL, file, email, and phone rows are left-aligned.
 - [ ] Confirm each row shows an action button.
-- [ ] Confirm shortcut hints appear in the bottom-right of each row, separate from item metadata.
+- [ ] Confirm clickable action buttons appear in the bottom-right of each row, with keyboard shortcuts underneath the icons.
+- [ ] Confirm image row tiles fill the row height.
 - [ ] Copy a test credit card number such as `4111 1111 1111 1111`.
 - [ ] Copy a test API key-shaped value such as `sk-proj-abcdefghijklmnopqrstuvwxyz123456`.
 - [ ] Confirm sensitive-looking values are masked in the row summary.
@@ -35,6 +36,8 @@ Use this script for release testing before filing issues.
 - [ ] Confirm the selected row stays visible while moving upward.
 - [ ] Select a URL item and press `O`.
 - [ ] Confirm the URL opens in the default browser.
+- [ ] Select a text item and press `C`.
+- [ ] Confirm the item is copied without pasting.
 - [ ] Select a file path item and press `O`.
 - [ ] Confirm the file opens.
 - [ ] Select a file path item and press `F`.
@@ -45,6 +48,8 @@ Use this script for release testing before filing issues.
 - [ ] Confirm macOS opens the configured phone handler.
 - [ ] Select any item and press `S`.
 - [ ] Confirm it is copied to the clipboard ready to share.
+- [ ] Click the bottom-right `Enter` paste action on an item.
+- [ ] Confirm the item pastes into the original app.
 - [ ] Press `Cmd+Down` or `Tab` to expand the list.
 - [ ] Press `Cmd+Up` to collapse the list.
 - [ ] Press `Escape` and confirm the palette closes without changing the clipboard.

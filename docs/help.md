@@ -38,6 +38,7 @@ Each row includes compact hints for the selected item's useful actions, such as 
 | `Up` / `Down` | Expand the list and move the selected item. |
 | `Right Arrow` | Open a 50% image preview, or zoom an open image preview to 100%. |
 | `Left Arrow` | Step an image preview back from 100% to 50%, or close it from 50%. |
+| `C` | Copy the selected item without pasting. |
 | `O` | Open the selected URL, file path, email address, or phone number. |
 | `F` | Reveal the selected file path in Finder. |
 | `S` | Copy the selected item so it is ready to share. |
@@ -49,7 +50,7 @@ Each row includes compact hints for the selected item's useful actions, such as 
 
 The compact palette shows the newest clipboard items with fixed-height, left-aligned rows and an action button for each item. The selected row is the item that will paste when you press `Enter`.
 
-Each row keeps the clipboard data on the left, item metadata underneath it, and compact shortcut hints in the bottom-right corner. The hints are intentionally small: `↵` means paste, `→` means image preview or preview zoom, `O` opens type-specific items, `F` reveals files in Finder, and `S` copies the item ready to share.
+Each row keeps the clipboard data on the left, item metadata underneath it, and compact action buttons in the bottom-right corner. Each button is clickable and includes its keyboard shortcut underneath the icon, so the row can be operated with either mouse or keyboard.
 
 The list automatically scrolls as you move the selected row with the keyboard.
 

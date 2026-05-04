@@ -44,21 +44,21 @@ const DEFAULT_HISTORY_LIMIT: usize = 100;
 const MIN_HISTORY_LIMIT: usize = 10;
 const MAX_HISTORY_LIMIT: usize = 1_000;
 const COMPACT_VISIBLE_ITEMS: usize = 3;
-const ROW_HEIGHT: f32 = 104.0;
-const THUMBNAIL_SIZE: f32 = 58.0;
-const TEXT_PREVIEW_HEIGHT: f32 = 42.0;
+const ROW_HEIGHT: f32 = 118.0;
+const THUMBNAIL_SIZE: f32 = 74.0;
+const TEXT_PREVIEW_HEIGHT: f32 = 48.0;
 const METADATA_HEIGHT: f32 = 20.0;
 const PREVIEW_SCALE: f32 = 0.5;
 const PREVIEW_MAX_IMAGE_WIDTH: f32 = 1_280.0;
 const PREVIEW_MAX_IMAGE_HEIGHT: f32 = 900.0;
-const HINT_CHIP_WIDTH: f32 = 26.0;
-const HINT_CHIP_HEIGHT: f32 = 22.0;
-const HINT_CHIP_GAP: f32 = 5.0;
+const HINT_CHIP_WIDTH: f32 = 48.0;
+const HINT_CHIP_HEIGHT: f32 = 42.0;
+const HINT_CHIP_GAP: f32 = 6.0;
 const FOCUS_HIDE_GRACE: Duration = Duration::from_millis(180);
 const CHANGE_COUNT_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 const PASTE_DELAY: Duration = Duration::from_millis(140);
 const PERMISSION_PROMPT_DELAY: Duration = Duration::from_millis(700);
-const COMPACT_HEIGHT: f32 = 432.0;
+const COMPACT_HEIGHT: f32 = 474.0;
 const EXPANDED_HEIGHT: f32 = 720.0;
 const SETTINGS_HEIGHT: f32 = 300.0;
 const APP_NAME: &str = "Better Clipboard";
@@ -1029,6 +1029,25 @@ impl BetterClipboardApp {
         }
     }
 
+    fn run_row_action(
+        &mut self,
+        action: RowAction,
+        item: &ClipItem,
+        data_dir: &Path,
+        ctx: &egui::Context,
+    ) {
+        match action {
+            RowAction::Paste => self.copy_and_paste_item(item, data_dir, ctx),
+            RowAction::Copy => {
+                self.copy_item(item, data_dir);
+            }
+            RowAction::Open => self.open_item(item, data_dir, ctx),
+            RowAction::Reveal => self.reveal_file_in_finder(item, ctx),
+            RowAction::Preview => self.open_image_preview(item, ctx),
+            RowAction::Share => self.share_item(item, data_dir),
+        }
+    }
+
     fn open_with_macos(
         &mut self,
         target: &str,
@@ -1110,6 +1129,7 @@ impl BetterClipboardApp {
         let right = ctx.input(|input| input.key_pressed(Key::ArrowRight));
         let left = ctx.input(|input| input.key_pressed(Key::ArrowLeft));
         let open = ctx.input(|input| input.key_pressed(Key::O));
+        let copy = ctx.input(|input| input.key_pressed(Key::C));
         let finder = ctx.input(|input| input.key_pressed(Key::F));
         let share = ctx.input(|input| input.key_pressed(Key::S));
 
@@ -1170,6 +1190,11 @@ impl BetterClipboardApp {
         if open {
             if let Some(index) = self.selected_index(visible_items) {
                 self.open_item(&visible_items[index], data_dir, ctx);
+            }
+        }
+        if copy {
+            if let Some(index) = self.selected_index(visible_items) {
+                self.copy_item(&visible_items[index], data_dir);
             }
         }
         if finder {
@@ -1435,6 +1460,7 @@ impl eframe::App for BetterClipboardApp {
                         let selected = self.selected == Some(item.id);
                         let fill = if selected { selected_bg } else { row_bg };
                         let row_width = ui.available_width();
+                        let mut row_action = None;
                         let response = egui::Frame::group(ui.style())
                             .fill(fill)
                             .inner_margin(10)
@@ -1472,7 +1498,8 @@ impl eframe::App for BetterClipboardApp {
                                                 egui::Label::new(
                                                     RichText::new(&item.summary).color(text_color),
                                                 )
-                                                .wrap(),
+                                                .wrap()
+                                                .halign(egui::Align::Min),
                                             );
                                             ui.add_sized(
                                                 egui::vec2(content_width, METADATA_HEIGHT),
@@ -1484,13 +1511,14 @@ impl eframe::App for BetterClipboardApp {
                                                     ))
                                                     .color(muted),
                                                 )
-                                                .truncate(),
+                                                .truncate()
+                                                .halign(egui::Align::Min),
                                             );
                                             ui.allocate_ui_with_layout(
                                                 egui::vec2(content_width, HINT_CHIP_HEIGHT),
                                                 egui::Layout::right_to_left(egui::Align::Center),
                                                 |ui| {
-                                                    show_row_hints(
+                                                    row_action = show_row_action_buttons(
                                                         ui,
                                                         item.kind,
                                                         self.settings.theme,
@@ -1514,6 +1542,10 @@ impl eframe::App for BetterClipboardApp {
 
                         if response.double_clicked() {
                             self.copy_and_paste_item(&item, &data_dir, ctx);
+                        }
+                        if let Some(action) = row_action {
+                            self.run_row_action(action, &item, &data_dir, ctx);
+                            ctx.request_repaint();
                         }
                         ui.add_space(6.0);
                     }
@@ -1725,33 +1757,100 @@ fn thumbnail_background(theme: ThemeMode) -> Color32 {
     }
 }
 
-fn show_row_hints(ui: &mut egui::Ui, kind: ClipKind, theme: ThemeMode) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowAction {
+    Paste,
+    Copy,
+    Open,
+    Reveal,
+    Preview,
+    Share,
+}
+
+fn show_row_action_buttons(
+    ui: &mut egui::Ui,
+    kind: ClipKind,
+    theme: ThemeMode,
+) -> Option<RowAction> {
     ui.spacing_mut().item_spacing.x = HINT_CHIP_GAP;
-    show_hint_chip(
+    let mut action = None;
+
+    if show_row_action_button(
         ui,
         ActionIcon::Share,
+        "S",
         "Share: copy this item ready to share",
         theme,
-    );
-
-    match kind {
-        ClipKind::Text => show_hint_chip(ui, ActionIcon::Copy, "Copy without pasting", theme),
-        ClipKind::Url => show_hint_chip(ui, ActionIcon::Open, "Open URL", theme),
-        ClipKind::FilePath => {
-            show_hint_chip(ui, ActionIcon::Finder, "Reveal in Finder", theme);
-            show_hint_chip(ui, ActionIcon::Open, "Open file", theme);
-        }
-        ClipKind::Email => show_hint_chip(ui, ActionIcon::Email, "Compose email", theme),
-        ClipKind::Phone => show_hint_chip(ui, ActionIcon::Phone, "Open phone handler", theme),
-        ClipKind::Image => show_hint_chip(
-            ui,
-            ActionIcon::Preview,
-            "Preview image; press again for 100%",
-            theme,
-        ),
+    )
+    .clicked()
+    {
+        action = Some(RowAction::Share);
     }
 
-    show_hint_chip(ui, ActionIcon::Paste, "Paste into the previous app", theme);
+    match kind {
+        ClipKind::Text => {
+            if show_row_action_button(ui, ActionIcon::Copy, "C", "Copy without pasting", theme)
+                .clicked()
+            {
+                action = Some(RowAction::Copy);
+            }
+        }
+        ClipKind::Url => {
+            if show_row_action_button(ui, ActionIcon::Open, "O", "Open URL", theme).clicked() {
+                action = Some(RowAction::Open);
+            }
+        }
+        ClipKind::FilePath => {
+            if show_row_action_button(ui, ActionIcon::Finder, "F", "Reveal in Finder", theme)
+                .clicked()
+            {
+                action = Some(RowAction::Reveal);
+            }
+            if show_row_action_button(ui, ActionIcon::Open, "O", "Open file", theme).clicked() {
+                action = Some(RowAction::Open);
+            }
+        }
+        ClipKind::Email => {
+            if show_row_action_button(ui, ActionIcon::Email, "O", "Compose email", theme).clicked()
+            {
+                action = Some(RowAction::Open);
+            }
+        }
+        ClipKind::Phone => {
+            if show_row_action_button(ui, ActionIcon::Phone, "O", "Open phone handler", theme)
+                .clicked()
+            {
+                action = Some(RowAction::Open);
+            }
+        }
+        ClipKind::Image => {
+            if show_row_action_button(
+                ui,
+                ActionIcon::Preview,
+                "Right",
+                "Preview image; press again for 100%",
+                theme,
+            )
+            .clicked()
+            {
+                action = Some(RowAction::Preview);
+            }
+        }
+    }
+
+    if show_row_action_button(
+        ui,
+        ActionIcon::Paste,
+        "Enter",
+        "Paste into the previous app",
+        theme,
+    )
+    .clicked()
+    {
+        action = Some(RowAction::Paste);
+    }
+
+    action
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1766,27 +1865,55 @@ enum ActionIcon {
     Share,
 }
 
-fn show_hint_chip(ui: &mut egui::Ui, icon: ActionIcon, hover_text: &str, theme: ThemeMode) {
+fn show_row_action_button(
+    ui: &mut egui::Ui,
+    icon: ActionIcon,
+    shortcut: &str,
+    hover_text: &str,
+    theme: ThemeMode,
+) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(HINT_CHIP_WIDTH, HINT_CHIP_HEIGHT),
-        egui::Sense::hover(),
+        egui::Sense::click(),
     );
-    ui.painter()
-        .rect_filled(rect, CornerRadius::same(4), hint_chip_background(theme));
+    let fill = if response.hovered() {
+        hint_chip_hover_background(theme)
+    } else {
+        hint_chip_background(theme)
+    };
+    ui.painter().rect_filled(rect, CornerRadius::same(5), fill);
     ui.painter().rect_stroke(
         rect,
-        CornerRadius::same(4),
+        CornerRadius::same(5),
         Stroke::new(1.0, hint_chip_stroke(theme)),
         egui::StrokeKind::Inside,
     );
-    draw_action_icon(ui.painter(), rect.shrink(5.0), icon, muted_text(theme), 1.4);
-    response.on_hover_text(hover_text);
+    let icon_rect = egui::Rect::from_center_size(
+        egui::pos2(rect.center().x, rect.top() + 14.0),
+        egui::vec2(15.0, 15.0),
+    );
+    draw_action_icon(ui.painter(), icon_rect, icon, muted_text(theme), 1.4);
+    ui.painter().text(
+        egui::pos2(rect.center().x, rect.bottom() - 8.0),
+        egui::Align2::CENTER_CENTER,
+        shortcut,
+        egui::FontId::proportional(9.5),
+        muted_text(theme),
+    );
+    response.on_hover_text(hover_text)
 }
 
 fn hint_chip_background(theme: ThemeMode) -> Color32 {
     match theme {
         ThemeMode::Light => Color32::from_rgb(248, 248, 246),
         ThemeMode::Dark => Color32::from_rgb(30, 30, 30),
+    }
+}
+
+fn hint_chip_hover_background(theme: ThemeMode) -> Color32 {
+    match theme {
+        ThemeMode::Light => Color32::from_rgb(238, 238, 235),
+        ThemeMode::Dark => Color32::from_rgb(42, 42, 42),
     }
 }
 
@@ -1997,10 +2124,8 @@ fn show_item_action_button(
     item: &ClipItem,
     theme: ThemeMode,
 ) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(
-        egui::vec2(THUMBNAIL_SIZE, THUMBNAIL_SIZE),
-        egui::Sense::click(),
-    );
+    let size = action_tile_size(item);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
     ui.painter()
         .rect_filled(rect, CornerRadius::same(7), thumbnail_background(theme));
     ui.painter().rect_stroke(
@@ -2058,6 +2183,14 @@ fn show_item_action_button(
         1.8,
     );
     response.on_hover_text(hover_text)
+}
+
+fn action_tile_size(item: &ClipItem) -> egui::Vec2 {
+    if item.kind == ClipKind::Image {
+        egui::vec2(ROW_HEIGHT, ROW_HEIGHT)
+    } else {
+        egui::vec2(THUMBNAIL_SIZE, THUMBNAIL_SIZE)
+    }
 }
 
 fn image_fit_rect(bounds: egui::Rect, width: usize, height: usize) -> egui::Rect {
