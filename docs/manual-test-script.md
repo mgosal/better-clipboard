@@ -17,7 +17,7 @@ Use this script for release testing before filing issues.
 - [ ] Open Better Clipboard with `Option+Space`.
 - [ ] Confirm all copied items appear in newest-first order.
 - [ ] Confirm text and URL rows are left-aligned.
-- [ ] Confirm image rows show thumbnails.
+- [ ] Confirm each row shows an action button.
 
 ## Keyboard Navigation
 
@@ -39,13 +39,17 @@ Use this script for release testing before filing issues.
 - [ ] Repeat with an image in an app that accepts image paste.
 - [ ] Double-click an item and confirm it pastes into the original app.
 
-## One-Click Copy
+## One-Click Actions
 
 - [ ] Open Better Clipboard.
-- [ ] Click the type glyph or thumbnail on a non-newest item.
+- [ ] Click the text action button on a non-newest text item.
 - [ ] Confirm the item is copied to the clipboard without pasting.
-- [ ] Confirm the item moves to the top of history.
+- [ ] Confirm the text item moves to the top of history.
 - [ ] Paste manually with `Cmd+V` and confirm the copied value is correct.
+- [ ] Click the URL action button on a URL item.
+- [ ] Confirm the URL opens in the default browser.
+- [ ] Click the image action button on an image item.
+- [ ] Confirm the image preview opens.
 
 ## Image Preview
 

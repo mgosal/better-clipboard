@@ -5,6 +5,7 @@ use std::{
     borrow::Cow,
     env, fs,
     path::{Path, PathBuf},
+    process::Command,
     sync::{Arc, Mutex, mpsc},
     thread,
     time::{Duration, Instant},
@@ -846,6 +847,43 @@ impl BetterClipboardApp {
         }
     }
 
+    fn run_item_action(&mut self, item: &ClipItem, data_dir: &Path, ctx: &egui::Context) {
+        match item.kind {
+            ClipKind::Text => {
+                self.copy_item(item, data_dir);
+            }
+            ClipKind::Url => {
+                self.open_url(item, ctx);
+            }
+            ClipKind::Image => {
+                self.open_image_preview(item, ctx);
+            }
+        }
+    }
+
+    fn open_url(&mut self, item: &ClipItem, ctx: &egui::Context) {
+        let Some(url) = item.text.as_deref() else {
+            self.status = "Open URL failed: missing URL payload".to_owned();
+            return;
+        };
+
+        if let Err(err) = Url::parse(url) {
+            self.status = format!("Open URL failed: {err}");
+            return;
+        }
+
+        match Command::new("open").arg(url).spawn() {
+            Ok(_) => {
+                self.status = "Opened URL".to_owned();
+                self.selected = Some(item.id);
+                self.hide_window(ctx);
+            }
+            Err(err) => {
+                self.status = format!("Open URL failed: {err}");
+            }
+        }
+    }
+
     fn handle_focus_loss(&mut self, ctx: &egui::Context) {
         if !self.window_visible || self.permission_onboarding {
             self.focus_loss_started = None;
@@ -1157,7 +1195,7 @@ impl eframe::App for BetterClipboardApp {
                                 ui.set_min_height(ROW_HEIGHT);
                                 ui.set_max_height(ROW_HEIGHT);
                                 ui.horizontal_top(|ui| {
-                                    let thumbnail_response = show_item_thumbnail(
+                                    let action_response = show_item_action_button(
                                         ui,
                                         ctx,
                                         &mut self.textures,
@@ -1165,8 +1203,8 @@ impl eframe::App for BetterClipboardApp {
                                         &item,
                                         self.settings.theme,
                                     );
-                                    if thumbnail_response.clicked() {
-                                        self.copy_item(&item, &data_dir);
+                                    if action_response.clicked() {
+                                        self.run_item_action(&item, &data_dir, ctx);
                                         ctx.request_repaint();
                                     }
                                     ui.add_space(8.0);
@@ -1440,7 +1478,7 @@ fn thumbnail_background(theme: ThemeMode) -> Color32 {
     }
 }
 
-fn show_item_thumbnail(
+fn show_item_action_button(
     ui: &mut egui::Ui,
     ctx: &egui::Context,
     textures: &mut std::collections::HashMap<Uuid, TextureHandle>,
@@ -1481,14 +1519,19 @@ fn show_item_thumbnail(
                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                 Color32::WHITE,
             );
-            return response.on_hover_text("Copy to clipboard");
+            return response.on_hover_text("Preview image");
         }
     }
 
     let glyph = match item.kind {
-        ClipKind::Text => "T",
+        ClipKind::Text => "⧉",
         ClipKind::Url => "↗",
         ClipKind::Image => "▧",
+    };
+    let hover_text = match item.kind {
+        ClipKind::Text => "Copy text to clipboard",
+        ClipKind::Url => "Open URL",
+        ClipKind::Image => "Preview image",
     };
     ui.painter().text(
         rect.center(),
@@ -1497,7 +1540,7 @@ fn show_item_thumbnail(
         egui::FontId::proportional(18.0),
         muted_text(theme),
     );
-    response.on_hover_text("Copy to clipboard")
+    response.on_hover_text(hover_text)
 }
 
 fn image_fit_rect(bounds: egui::Rect, width: usize, height: usize) -> egui::Rect {

@@ -8,7 +8,7 @@ Escape, pressing the shortcut again, or clicking into another app cancels the pa
 
 When the palette opens, the newest item is selected. Press Enter or double-click an item to copy it, hide Better Clipboard, reactivate the app that was focused before the palette opened, and send `Cmd+V`. If macOS blocks the synthetic paste event, the item is still on the clipboard.
 
-Click an item's thumbnail or type glyph to copy it to the clipboard without pasting. For image items, press `Right Arrow` to open a larger floating preview; `Escape` closes the preview and `Enter` pastes the image.
+Click an item's action button to run its default action: text copies to the clipboard, URLs open in the default browser, and images open a larger floating preview. This does not change row behavior: pressing `Enter` or double-clicking any text, URL, or image row still pastes that item into the previously active app. For image items, `Right Arrow` also opens the preview; `Escape` closes the preview and `Enter` pastes the image.
 
 macOS does not expose an event queue of past clipboard contents, so very rapid clipboard changes can still collapse to the newest available payload. Better Clipboard checks the change counter every 100 ms to catch normal copy flows without continuously reading clipboard contents.
 

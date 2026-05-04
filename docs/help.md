@@ -12,7 +12,13 @@ Better Clipboard is a macOS clipboard history palette. It keeps recent text, URL
 
 When an item is selected with `Enter` or double-click, Better Clipboard puts that item on the clipboard, hides the palette, reactivates the app that was focused before Better Clipboard opened, and sends `Cmd+V`. If paste input is blocked by macOS permissions, the item remains on the clipboard so you can paste manually.
 
-Click an item's thumbnail or type glyph to copy it to the clipboard without pasting. That also moves the item to the top of the history so it behaves like the newest copied item.
+Click an item's action button to run its default action:
+
+- Text copies to the clipboard without pasting. That also moves the item to the top of the history so it behaves like the newest copied item.
+- URLs open in the default browser.
+- Images open the larger floating preview.
+
+The action button is separate from row activation. Pressing `Enter` or double-clicking a text, URL, or image row still pastes that item into the previously active app.
 
 ## Shortcuts
 
@@ -32,7 +38,7 @@ Click an item's thumbnail or type glyph to copy it to the clipboard without past
 
 ## Palette
 
-The compact palette shows the newest clipboard items with fixed-height, left-aligned rows and small thumbnails for images. The selected row is the item that will paste when you press `Enter`.
+The compact palette shows the newest clipboard items with fixed-height, left-aligned rows and an action button for each item. The selected row is the item that will paste when you press `Enter`.
 
 The list automatically scrolls as you move the selected row with the keyboard.
 
