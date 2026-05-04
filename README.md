@@ -64,6 +64,8 @@ The release binary is written to `target/release/better-clipboard`.
 
 Better Clipboard is built around solving the problem directly in front of you: keep the clipboard history close, make recall fast, and avoid turning a small utility into a platform.
 
+It also fits a broader software-as-devices idea: focused apps should be something you summon, operate with keyboard shortcuts and direct commands, then dismiss. Better Clipboard should feel like a small clipboard device, not a software destination the user has to manage.
+
 AI tools make this style of software easier to build because you can move in small, concrete loops: try the workflow, notice the friction, change the exact behavior, and test again. The goal is not to generate a large product surface. The goal is to keep shaving the tool until the common action feels obvious.
 
 ## License
