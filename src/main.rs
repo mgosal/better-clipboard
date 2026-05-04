@@ -47,8 +47,11 @@ const COMPACT_VISIBLE_ITEMS: usize = 3;
 const ROW_HEIGHT: f32 = 58.0;
 const THUMBNAIL_SIZE: f32 = 42.0;
 const PREVIEW_SCALE: f32 = 0.5;
-const PREVIEW_MAX_IMAGE_WIDTH: f32 = 860.0;
-const PREVIEW_MAX_IMAGE_HEIGHT: f32 = 560.0;
+const PREVIEW_MAX_IMAGE_WIDTH: f32 = 1_280.0;
+const PREVIEW_MAX_IMAGE_HEIGHT: f32 = 900.0;
+const HINT_CHIP_WIDTH: f32 = 22.0;
+const HINT_CHIP_HEIGHT: f32 = 18.0;
+const HINT_CHIP_GAP: f32 = 4.0;
 const FOCUS_HIDE_GRACE: Duration = Duration::from_millis(180);
 const CHANGE_COUNT_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 const PASTE_DELAY: Duration = Duration::from_millis(140);
@@ -606,11 +609,32 @@ struct BetterClipboardApp {
     force_quit: bool,
     select_first_on_show: bool,
     palette_expanded: bool,
-    preview_item: Option<Uuid>,
+    preview_item: Option<ImagePreviewState>,
     previous_frontmost_pid: Option<i32>,
     shown_at: Instant,
     focus_loss_started: Option<Instant>,
     last_repaint: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ImagePreviewState {
+    item_id: Uuid,
+    scale: ImagePreviewScale,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImagePreviewScale {
+    Half,
+    Full,
+}
+
+impl ImagePreviewScale {
+    fn factor(self) -> f32 {
+        match self {
+            Self::Half => PREVIEW_SCALE,
+            Self::Full => 1.0,
+        }
+    }
 }
 
 impl BetterClipboardApp {
@@ -862,8 +886,29 @@ impl BetterClipboardApp {
 
     fn open_image_preview(&mut self, item: &ClipItem, ctx: &egui::Context) {
         if item.kind == ClipKind::Image {
-            self.preview_item = Some(item.id);
+            self.preview_item = Some(ImagePreviewState {
+                item_id: item.id,
+                scale: ImagePreviewScale::Half,
+            });
             ctx.request_repaint();
+        }
+    }
+
+    fn zoom_image_preview_in(&mut self, ctx: &egui::Context) {
+        if let Some(preview) = &mut self.preview_item {
+            preview.scale = ImagePreviewScale::Full;
+            ctx.request_repaint();
+        }
+    }
+
+    fn step_image_preview_back(&mut self, ctx: &egui::Context) {
+        match self.preview_item.as_mut() {
+            Some(preview) if preview.scale == ImagePreviewScale::Full => {
+                preview.scale = ImagePreviewScale::Half;
+                ctx.request_repaint();
+            }
+            Some(_) => self.close_image_preview(ctx),
+            None => {}
         }
     }
 
@@ -1061,20 +1106,20 @@ impl BetterClipboardApp {
         let enter = ctx.input(|input| input.key_pressed(Key::Enter));
         let escape = ctx.input(|input| input.key_pressed(Key::Escape));
         let right = ctx.input(|input| input.key_pressed(Key::ArrowRight));
+        let left = ctx.input(|input| input.key_pressed(Key::ArrowLeft));
         let open = ctx.input(|input| input.key_pressed(Key::O));
         let finder = ctx.input(|input| input.key_pressed(Key::F));
         let share = ctx.input(|input| input.key_pressed(Key::S));
 
-        if escape {
-            if self.preview_item.is_some() {
-                self.close_image_preview(ctx);
-            } else {
-                self.hide_window(ctx);
-            }
-            return;
-        }
-
         if self.preview_item.is_some() {
+            if right {
+                self.zoom_image_preview_in(ctx);
+                return;
+            }
+            if left || escape {
+                self.step_image_preview_back(ctx);
+                return;
+            }
             if enter {
                 if let Some(index) = self.selected_index(visible_items) {
                     self.copy_and_paste_item(&visible_items[index], data_dir, ctx);
@@ -1085,6 +1130,11 @@ impl BetterClipboardApp {
                     self.share_item(&visible_items[index], data_dir);
                 }
             }
+            return;
+        }
+
+        if escape {
+            self.hide_window(ctx);
             return;
         }
 
@@ -1419,18 +1469,37 @@ impl eframe::App for BetterClipboardApp {
                                                 )
                                                 .truncate(),
                                             );
-                                            ui.add(
-                                                egui::Label::new(
-                                                    RichText::new(format!(
-                                                        "{} · {} · {}",
-                                                        item.kind.label(),
-                                                        item.created_at.format("%H:%M:%S"),
-                                                        item_hint(&item)
-                                                    ))
-                                                    .color(muted),
-                                                )
-                                                .truncate(),
-                                            );
+                                            ui.horizontal(|ui| {
+                                                let hint_width = row_hint_width(item.kind);
+                                                let meta_width =
+                                                    (ui.available_width() - hint_width - 8.0)
+                                                        .max(80.0);
+                                                ui.add_sized(
+                                                    egui::vec2(meta_width, HINT_CHIP_HEIGHT),
+                                                    egui::Label::new(
+                                                        RichText::new(format!(
+                                                            "{} · {}",
+                                                            item.kind.label(),
+                                                            item.created_at.format("%H:%M:%S")
+                                                        ))
+                                                        .color(muted),
+                                                    )
+                                                    .truncate(),
+                                                );
+                                                ui.allocate_ui_with_layout(
+                                                    egui::vec2(hint_width, HINT_CHIP_HEIGHT),
+                                                    egui::Layout::right_to_left(
+                                                        egui::Align::Center,
+                                                    ),
+                                                    |ui| {
+                                                        show_row_hints(
+                                                            ui,
+                                                            item.kind,
+                                                            self.settings.theme,
+                                                        );
+                                                    },
+                                                );
+                                            });
                                         },
                                     );
                                 });
@@ -1463,15 +1532,21 @@ impl eframe::App for BetterClipboardApp {
 enum PreviewAction {
     None,
     Close,
+    Back,
+    ZoomIn,
     Paste,
 }
 
 impl BetterClipboardApp {
     fn show_image_preview(&mut self, ctx: &egui::Context, data_dir: &Path, items: &[ClipItem]) {
-        let Some(preview_id) = self.preview_item else {
+        let Some(preview) = self.preview_item else {
             return;
         };
-        let Some(item) = items.iter().find(|item| item.id == preview_id).cloned() else {
+        let Some(item) = items
+            .iter()
+            .find(|item| item.id == preview.item_id)
+            .cloned()
+        else {
             self.close_image_preview(ctx);
             return;
         };
@@ -1480,7 +1555,7 @@ impl BetterClipboardApp {
             return;
         };
 
-        let image_size = preview_image_size(ctx, image.width, image.height);
+        let image_size = preview_image_size(ctx, image.width, image.height, preview.scale);
         let window_size = image_size;
 
         if !self.textures.contains_key(&item.id) {
@@ -1504,7 +1579,13 @@ impl BetterClipboardApp {
                 return PreviewAction::Close;
             }
             if ctx.input(|input| input.key_pressed(Key::Escape)) {
-                return PreviewAction::Close;
+                return PreviewAction::Back;
+            }
+            if ctx.input(|input| input.key_pressed(Key::ArrowLeft)) {
+                return PreviewAction::Back;
+            }
+            if ctx.input(|input| input.key_pressed(Key::ArrowRight)) {
+                return PreviewAction::ZoomIn;
             }
             if ctx.input(|input| input.key_pressed(Key::Enter)) {
                 return PreviewAction::Paste;
@@ -1534,6 +1615,8 @@ impl BetterClipboardApp {
         match action {
             PreviewAction::None => {}
             PreviewAction::Close => self.close_image_preview(ctx),
+            PreviewAction::Back => self.step_image_preview_back(ctx),
+            PreviewAction::ZoomIn => self.zoom_image_preview_in(ctx),
             PreviewAction::Paste => self.copy_and_paste_item(&item, data_dir, ctx),
         }
     }
@@ -1570,33 +1653,27 @@ fn image_preview_viewport_builder(ctx: &egui::Context, size: egui::Vec2) -> egui
 }
 
 fn image_preview_position(ctx: &egui::Context, size: egui::Vec2) -> Option<egui::Pos2> {
-    const GAP: f32 = 12.0;
     const SCREEN_MARGIN: f32 = 8.0;
 
     ctx.input(|input| {
-        let palette = input.viewport().outer_rect?;
         let monitor_size = input.viewport().monitor_size?;
-        let right = palette.right() + GAP;
-        let left = palette.left() - size.x - GAP;
-        let x = if right + size.x <= monitor_size.x - SCREEN_MARGIN {
-            right
-        } else if left >= SCREEN_MARGIN {
-            left
-        } else {
-            ((monitor_size.x - size.x) * 0.5).max(SCREEN_MARGIN)
-        };
-        let max_y = (monitor_size.y - size.y - SCREEN_MARGIN).max(SCREEN_MARGIN);
-        let y = palette.top().clamp(SCREEN_MARGIN, max_y);
+        let x = ((monitor_size.x - size.x) * 0.5).max(SCREEN_MARGIN);
+        let y = ((monitor_size.y - size.y) * 0.5).max(SCREEN_MARGIN);
         Some(egui::pos2(x, y))
     })
 }
 
-fn preview_image_size(ctx: &egui::Context, width: usize, height: usize) -> egui::Vec2 {
+fn preview_image_size(
+    ctx: &egui::Context,
+    width: usize,
+    height: usize,
+    scale: ImagePreviewScale,
+) -> egui::Vec2 {
     let width = width.max(1) as f32;
     let height = height.max(1) as f32;
     let pixels_per_point = ctx.pixels_per_point().max(1.0);
     let native_size = egui::vec2(width / pixels_per_point, height / pixels_per_point);
-    let scaled = native_size * PREVIEW_SCALE;
+    let scaled = native_size * scale.factor();
     let cap_scale = (PREVIEW_MAX_IMAGE_WIDTH / scaled.x)
         .min(PREVIEW_MAX_IMAGE_HEIGHT / scaled.y)
         .min(1.0);
@@ -1651,14 +1728,67 @@ fn thumbnail_background(theme: ThemeMode) -> Color32 {
     }
 }
 
-fn item_hint(item: &ClipItem) -> &'static str {
-    match item.kind {
-        ClipKind::Text => "Enter paste · click copy · S share",
-        ClipKind::Url => "Enter paste · click/O open · S share",
-        ClipKind::FilePath => "Enter paste · click/F Finder · O open · S share",
-        ClipKind::Email => "Enter paste · click/O compose · S share",
-        ClipKind::Phone => "Enter paste · click/O call · S share",
-        ClipKind::Image => "Enter paste · click/Right preview · S share",
+fn row_hint_width(kind: ClipKind) -> f32 {
+    let count = match kind {
+        ClipKind::FilePath => 4.0,
+        _ => 3.0,
+    };
+    count * HINT_CHIP_WIDTH + (count - 1.0) * HINT_CHIP_GAP
+}
+
+fn show_row_hints(ui: &mut egui::Ui, kind: ClipKind, theme: ThemeMode) {
+    ui.spacing_mut().item_spacing.x = HINT_CHIP_GAP;
+    show_hint_chip(ui, "S", "Share: copy this item ready to share", theme);
+
+    match kind {
+        ClipKind::Text => show_hint_chip(ui, "⧉", "Click the tile: copy without pasting", theme),
+        ClipKind::Url => show_hint_chip(ui, "O", "Open URL", theme),
+        ClipKind::FilePath => {
+            show_hint_chip(ui, "F", "Reveal in Finder", theme);
+            show_hint_chip(ui, "O", "Open file", theme);
+        }
+        ClipKind::Email => show_hint_chip(ui, "O", "Compose email", theme),
+        ClipKind::Phone => show_hint_chip(ui, "O", "Open phone handler", theme),
+        ClipKind::Image => show_hint_chip(ui, "→", "Preview image; press again for 100%", theme),
+    }
+
+    show_hint_chip(ui, "↵", "Paste into the previous app", theme);
+}
+
+fn show_hint_chip(ui: &mut egui::Ui, label: &str, hover_text: &str, theme: ThemeMode) {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(HINT_CHIP_WIDTH, HINT_CHIP_HEIGHT),
+        egui::Sense::hover(),
+    );
+    ui.painter()
+        .rect_filled(rect, CornerRadius::same(4), hint_chip_background(theme));
+    ui.painter().rect_stroke(
+        rect,
+        CornerRadius::same(4),
+        Stroke::new(1.0, hint_chip_stroke(theme)),
+        egui::StrokeKind::Inside,
+    );
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        label,
+        egui::FontId::proportional(11.0),
+        muted_text(theme),
+    );
+    response.on_hover_text(hover_text);
+}
+
+fn hint_chip_background(theme: ThemeMode) -> Color32 {
+    match theme {
+        ThemeMode::Light => Color32::from_rgb(248, 248, 246),
+        ThemeMode::Dark => Color32::from_rgb(30, 30, 30),
+    }
+}
+
+fn hint_chip_stroke(theme: ThemeMode) -> Color32 {
+    match theme {
+        ThemeMode::Light => Color32::from_rgb(205, 205, 202),
+        ThemeMode::Dark => Color32::from_rgb(70, 70, 70),
     }
 }
 

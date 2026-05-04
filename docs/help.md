@@ -36,7 +36,8 @@ Each row includes compact hints for the selected item's useful actions, such as 
 | `Double-click` | Paste the clicked history item into the previously focused app. |
 | `Escape` | Close the palette without copying or pasting. |
 | `Up` / `Down` | Expand the list and move the selected item. |
-| `Right Arrow` | Open a larger floating preview for the selected image item. |
+| `Right Arrow` | Open a 50% image preview, or zoom an open image preview to 100%. |
+| `Left Arrow` | Step an image preview back from 100% to 50%, or close it from 50%. |
 | `O` | Open the selected URL, file path, email address, or phone number. |
 | `F` | Reveal the selected file path in Finder. |
 | `S` | Copy the selected item so it is ready to share. |
@@ -47,6 +48,8 @@ Each row includes compact hints for the selected item's useful actions, such as 
 ## Palette
 
 The compact palette shows the newest clipboard items with fixed-height, left-aligned rows and an action button for each item. The selected row is the item that will paste when you press `Enter`.
+
+Each row keeps the clipboard data on the left, item metadata underneath it, and compact shortcut hints in the bottom-right corner. The hints are intentionally small: `↵` means paste, `→` means image preview or preview zoom, `O` opens type-specific items, `F` reveals files in Finder, and `S` copies the item ready to share.
 
 The list automatically scrolls as you move the selected row with the keyboard.
 
@@ -77,11 +80,12 @@ Masking only affects the row text shown in the palette. The raw clipboard payloa
 
 ## Image Preview
 
-Select an image item and press `Right Arrow` to open an image-only floating preview. The preview is scaled to about 50% of the original display size, accounting for Retina scaling, and capped so it stays practical on screen.
+Select an image item and press `Right Arrow` to open a centered image-only floating preview. The first preview is scaled to about 50% of the original display size, accounting for Retina scaling, and capped so it stays practical on screen. Press `Right Arrow` again to move to 100% scale.
 
 While the preview is open:
 
-- `Escape` closes the preview and keeps the palette open.
+- `Left Arrow` steps the preview from 100% back to 50%, then closes it from 50%.
+- `Escape` follows the same path as `Left Arrow`.
 - `Enter` closes the preview, hides the palette, and pastes the image into the previously focused app.
 
 ## Settings

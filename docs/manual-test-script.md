@@ -22,6 +22,7 @@ Use this script for release testing before filing issues.
 - [ ] Confirm all copied items appear in newest-first order.
 - [ ] Confirm text, URL, file, email, and phone rows are left-aligned.
 - [ ] Confirm each row shows an action button.
+- [ ] Confirm shortcut hints appear in the bottom-right of each row, separate from item metadata.
 - [ ] Copy a test credit card number such as `4111 1111 1111 1111`.
 - [ ] Copy a test API key-shaped value such as `sk-proj-abcdefghijklmnopqrstuvwxyz123456`.
 - [ ] Confirm sensitive-looking values are masked in the row summary.
@@ -80,7 +81,9 @@ Use this script for release testing before filing issues.
 
 - [ ] Select an image item.
 - [ ] Press `Right Arrow`.
-- [ ] Confirm an image-only floating preview opens next to the palette at about 50% display size.
+- [ ] Confirm an image-only floating preview opens centered at about 50% display size.
+- [ ] Press `Right Arrow` again and confirm the preview grows to 100% display size.
+- [ ] Press `Left Arrow` and confirm the preview returns to 50%.
 - [ ] Press `Escape` and confirm only the preview closes.
 - [ ] Open the preview again and press `Enter`.
 - [ ] Confirm the preview and palette close, then the image is pasted into the original app.
