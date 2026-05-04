@@ -37,7 +37,7 @@ Use this script for release testing before filing issues.
 - [ ] Select a URL item and press `O`.
 - [ ] Confirm the URL opens in the default browser.
 - [ ] Select a text item and press `C`.
-- [ ] Confirm the item is copied without pasting.
+- [ ] Confirm the item is copied without pasting, the palette closes, and the item does not move to the top of the history.
 - [ ] Select a file path item and press `O`.
 - [ ] Confirm the file opens.
 - [ ] Select a file path item and press `F`.
@@ -47,8 +47,8 @@ Use this script for release testing before filing issues.
 - [ ] Select a phone item and press `O`.
 - [ ] Confirm macOS opens the configured phone handler.
 - [ ] Select any item and press `S`.
-- [ ] Confirm it is copied to the clipboard ready to share.
-- [ ] Click the bottom-right `Enter` paste action on an item.
+- [ ] Confirm it is copied to the clipboard ready to share, and the palette closes.
+- [ ] Click the bottom-right `Paste` / `Enter` action on an item.
 - [ ] Confirm the item pastes into the original app.
 - [ ] Press `Cmd+Down` or `Tab` to expand the list.
 - [ ] Press `Cmd+Up` to collapse the list.
@@ -67,7 +67,7 @@ Use this script for release testing before filing issues.
 ## One-Click Actions
 
 - [ ] Open Better Clipboard.
-- [ ] Click the text action button on a non-newest text item.
+- [ ] Click the left text type tile on a non-newest text item.
 - [ ] Confirm the item is copied to the clipboard without pasting.
 - [ ] Confirm the text item moves to the top of history.
 - [ ] Paste manually with `Cmd+V` and confirm the copied value is correct.
@@ -81,6 +81,10 @@ Use this script for release testing before filing issues.
 - [ ] Confirm macOS opens the configured phone handler.
 - [ ] Click the image action button on an image item.
 - [ ] Confirm the image preview opens.
+- [ ] Reopen Better Clipboard and click the bottom-right `Copy` / `C` button on a non-newest text item.
+- [ ] Confirm the palette closes and the item is copied without moving to the top of history.
+- [ ] Reopen Better Clipboard and click the bottom-right `Share` / `S` button.
+- [ ] Confirm the palette closes and the selected item is on the clipboard.
 
 ## Image Preview
 

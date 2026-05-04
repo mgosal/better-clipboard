@@ -8,7 +8,7 @@ Escape, pressing the shortcut again, or clicking into another app cancels the pa
 
 When the palette opens, the newest item is selected. Press Enter or double-click an item to copy it, hide Better Clipboard, reactivate the app that was focused before the palette opened, and send `Cmd+V`. If macOS blocks the synthetic paste event, the item is still on the clipboard.
 
-Click an item's action button to run its default action: text copies to the clipboard, URLs open in the default browser, file paths reveal in Finder, email addresses open a mail composer, phone numbers open the system phone handler, and images open a larger floating preview. This does not change row behavior: pressing `Enter` or double-clicking any row still pastes that item into the previously active app. For type-specific keyboard actions, use `O` to open URL/file/email/phone items, `F` to reveal file paths in Finder, and `S` to copy the selected item ready for sharing.
+Click an item's left type tile to run its default action: text copies to the clipboard, URLs open in the default browser, file paths reveal in Finder, email addresses open a mail composer, phone numbers open the system phone handler, and images open a larger floating preview. Bottom-right row buttons expose the keyboard actions directly: Paste/`Enter`, Copy/`C`, Open/`O`, Finder/`F`, Preview/`Right`, and Share/`S` where relevant. Pressing `Enter` or double-clicking any row still pastes that item into the previously active app.
 
 Sensitive-looking values such as Luhn-valid credit card numbers and common API key formats are masked in the palette display. The original value is still kept as the clipboard payload so paste, copy, and share-prep actions work correctly.
 
@@ -25,10 +25,10 @@ macOS does not expose an event queue of past clipboard contents, so very rapid c
 - `Up` / `Down`: expand the list and move selection.
 - `Right Arrow`: preview the selected image item; press again for 100% scale.
 - `Left Arrow`: step the image preview back from 100% to 50%, or close it from 50%.
-- `C`: copy the selected item without pasting.
+- `C`: copy the selected item without pasting, then close the palette.
 - `O`: open the selected URL, file path, email address, or phone number.
 - `F`: reveal the selected file path in Finder.
-- `S`: copy the selected item so it is ready to share.
+- `S`: copy the selected item so it is ready to share, then close the palette.
 - `Cmd+Down` or `Tab`: expand the list.
 - `Cmd+Up`: collapse the list.
 

@@ -46,13 +46,13 @@ const MAX_HISTORY_LIMIT: usize = 1_000;
 const COMPACT_VISIBLE_ITEMS: usize = 3;
 const ROW_HEIGHT: f32 = 118.0;
 const THUMBNAIL_SIZE: f32 = 74.0;
-const TEXT_PREVIEW_HEIGHT: f32 = 48.0;
-const METADATA_HEIGHT: f32 = 20.0;
+const TEXT_PREVIEW_HEIGHT: f32 = 44.0;
+const METADATA_HEIGHT: f32 = 18.0;
 const PREVIEW_SCALE: f32 = 0.5;
 const PREVIEW_MAX_IMAGE_WIDTH: f32 = 1_280.0;
 const PREVIEW_MAX_IMAGE_HEIGHT: f32 = 900.0;
-const HINT_CHIP_WIDTH: f32 = 48.0;
-const HINT_CHIP_HEIGHT: f32 = 42.0;
+const HINT_CHIP_WIDTH: f32 = 58.0;
+const HINT_CHIP_HEIGHT: f32 = 48.0;
 const HINT_CHIP_GAP: f32 = 6.0;
 const FOCUS_HIDE_GRACE: Duration = Duration::from_millis(180);
 const CHANGE_COUNT_CHECK_INTERVAL: Duration = Duration::from_millis(100);
@@ -407,6 +407,7 @@ struct HistoryStore {
     data_dir: PathBuf,
     max_items: usize,
     items: Vec<ClipItem>,
+    suppressed_hashes: Vec<String>,
 }
 
 impl HistoryStore {
@@ -415,6 +416,7 @@ impl HistoryStore {
             data_dir,
             max_items,
             items: Vec::new(),
+            suppressed_hashes: Vec::new(),
         }
     }
 
@@ -438,6 +440,7 @@ impl HistoryStore {
             data_dir,
             max_items,
             items,
+            suppressed_hashes: Vec::new(),
         };
         if changed {
             store.save().context("save normalized history")?;
@@ -447,6 +450,14 @@ impl HistoryStore {
 
     fn push(&mut self, snapshot: ClipboardSnapshot) -> Result<()> {
         let hash = snapshot.hash().to_owned();
+        if let Some(index) = self
+            .suppressed_hashes
+            .iter()
+            .position(|suppressed| suppressed == &hash)
+        {
+            self.suppressed_hashes.remove(index);
+            return Ok(());
+        }
         if self.items.first().is_some_and(|item| item.hash == hash) {
             return Ok(());
         }
@@ -465,6 +476,26 @@ impl HistoryStore {
         self.items.insert(0, item);
         self.prune_to_limit();
         self.save()
+    }
+
+    fn suppress_next_hash(&mut self, hash: &str) {
+        if !self
+            .suppressed_hashes
+            .iter()
+            .any(|suppressed| suppressed == hash)
+        {
+            self.suppressed_hashes.push(hash.to_owned());
+        }
+    }
+
+    fn allow_hash(&mut self, hash: &str) {
+        if let Some(index) = self
+            .suppressed_hashes
+            .iter()
+            .position(|suppressed| suppressed == hash)
+        {
+            self.suppressed_hashes.remove(index);
+        }
     }
 
     fn promote(&mut self, id: Uuid) -> Result<()> {
@@ -830,6 +861,45 @@ impl BetterClipboardApp {
         }
     }
 
+    fn copy_item_without_history_move(
+        &mut self,
+        item: &ClipItem,
+        data_dir: &Path,
+        status: &str,
+    ) -> bool {
+        if let Ok(mut store) = self.store.lock() {
+            store.suppress_next_hash(&item.hash);
+        }
+
+        match copy_item_to_clipboard(item, data_dir) {
+            Ok(()) => {
+                self.status = status.to_owned();
+                self.selected = Some(item.id);
+                true
+            }
+            Err(err) => {
+                if let Ok(mut store) = self.store.lock() {
+                    store.allow_hash(&item.hash);
+                }
+                self.status = format!("Copy failed: {err:#}");
+                false
+            }
+        }
+    }
+
+    fn copy_item_and_hide(
+        &mut self,
+        item: &ClipItem,
+        data_dir: &Path,
+        ctx: &egui::Context,
+        status: &str,
+    ) {
+        if self.copy_item_without_history_move(item, data_dir, status) {
+            self.close_image_preview(ctx);
+            self.hide_window(ctx);
+        }
+    }
+
     fn copy_and_paste_item(&mut self, item: &ClipItem, data_dir: &Path, ctx: &egui::Context) {
         if self.copy_item(item, data_dir) {
             self.status = format!(
@@ -1023,12 +1093,6 @@ impl BetterClipboardApp {
         );
     }
 
-    fn share_item(&mut self, item: &ClipItem, data_dir: &Path) {
-        if self.copy_item(item, data_dir) {
-            self.status = format!("Copied {} for sharing", item.kind.label().to_lowercase());
-        }
-    }
-
     fn run_row_action(
         &mut self,
         action: RowAction,
@@ -1038,13 +1102,21 @@ impl BetterClipboardApp {
     ) {
         match action {
             RowAction::Paste => self.copy_and_paste_item(item, data_dir, ctx),
-            RowAction::Copy => {
-                self.copy_item(item, data_dir);
-            }
+            RowAction::Copy => self.copy_item_and_hide(
+                item,
+                data_dir,
+                ctx,
+                &format!("Copied {}", item.kind.label().to_lowercase()),
+            ),
             RowAction::Open => self.open_item(item, data_dir, ctx),
             RowAction::Reveal => self.reveal_file_in_finder(item, ctx),
             RowAction::Preview => self.open_image_preview(item, ctx),
-            RowAction::Share => self.share_item(item, data_dir),
+            RowAction::Share => self.copy_item_and_hide(
+                item,
+                data_dir,
+                ctx,
+                &format!("Copied {} for sharing", item.kind.label().to_lowercase()),
+            ),
         }
     }
 
@@ -1147,9 +1219,26 @@ impl BetterClipboardApp {
                     self.copy_and_paste_item(&visible_items[index], data_dir, ctx);
                 }
             }
+            if copy {
+                if let Some(index) = self.selected_index(visible_items) {
+                    let item = &visible_items[index];
+                    self.copy_item_and_hide(
+                        item,
+                        data_dir,
+                        ctx,
+                        &format!("Copied {}", item.kind.label().to_lowercase()),
+                    );
+                }
+            }
             if share {
                 if let Some(index) = self.selected_index(visible_items) {
-                    self.share_item(&visible_items[index], data_dir);
+                    let item = &visible_items[index];
+                    self.copy_item_and_hide(
+                        item,
+                        data_dir,
+                        ctx,
+                        &format!("Copied {} for sharing", item.kind.label().to_lowercase()),
+                    );
                 }
             }
             return;
@@ -1194,7 +1283,13 @@ impl BetterClipboardApp {
         }
         if copy {
             if let Some(index) = self.selected_index(visible_items) {
-                self.copy_item(&visible_items[index], data_dir);
+                let item = &visible_items[index];
+                self.copy_item_and_hide(
+                    item,
+                    data_dir,
+                    ctx,
+                    &format!("Copied {}", item.kind.label().to_lowercase()),
+                );
             }
         }
         if finder {
@@ -1206,7 +1301,13 @@ impl BetterClipboardApp {
         }
         if share {
             if let Some(index) = self.selected_index(visible_items) {
-                self.share_item(&visible_items[index], data_dir);
+                let item = &visible_items[index];
+                self.copy_item_and_hide(
+                    item,
+                    data_dir,
+                    ctx,
+                    &format!("Copied {} for sharing", item.kind.label().to_lowercase()),
+                );
             }
         }
         if enter {
@@ -1461,91 +1562,99 @@ impl eframe::App for BetterClipboardApp {
                         let fill = if selected { selected_bg } else { row_bg };
                         let row_width = ui.available_width();
                         let mut row_action = None;
-                        let response = egui::Frame::group(ui.style())
-                            .fill(fill)
-                            .inner_margin(10)
-                            .show(ui, |ui| {
-                                ui.set_min_width(row_width - 20.0);
-                                ui.set_min_height(ROW_HEIGHT);
-                                ui.set_max_height(ROW_HEIGHT);
-                                ui.horizontal_top(|ui| {
-                                    let action_response = show_item_action_button(
-                                        ui,
-                                        ctx,
-                                        &mut self.textures,
-                                        &data_dir,
-                                        &item,
-                                        self.settings.theme,
-                                    );
-                                    if action_response.clicked() {
-                                        self.run_item_action(&item, &data_dir, ctx);
-                                        ctx.request_repaint();
-                                    }
-                                    ui.add_space(8.0);
-                                    let content_width = ui.available_width();
-                                    ui.allocate_ui_with_layout(
-                                        egui::vec2(content_width, ROW_HEIGHT),
-                                        egui::Layout::top_down(egui::Align::Min),
-                                        |ui| {
-                                            ui.spacing_mut().item_spacing.y = 2.0;
-                                            let text_color = if selected {
-                                                selected_text(self.settings.theme)
-                                            } else {
-                                                ui.visuals().text_color()
-                                            };
-                                            ui.add_sized(
-                                                egui::vec2(content_width, TEXT_PREVIEW_HEIGHT),
-                                                egui::Label::new(
-                                                    RichText::new(&item.summary).color(text_color),
-                                                )
-                                                .wrap()
-                                                .halign(egui::Align::Min),
-                                            );
-                                            ui.add_sized(
-                                                egui::vec2(content_width, METADATA_HEIGHT),
-                                                egui::Label::new(
-                                                    RichText::new(format!(
-                                                        "{} · {}",
-                                                        item.kind.label(),
-                                                        item.created_at.format("%H:%M:%S")
-                                                    ))
-                                                    .color(muted),
-                                                )
-                                                .truncate()
-                                                .halign(egui::Align::Min),
-                                            );
-                                            ui.allocate_ui_with_layout(
-                                                egui::vec2(content_width, HINT_CHIP_HEIGHT),
-                                                egui::Layout::right_to_left(egui::Align::Center),
-                                                |ui| {
-                                                    row_action = show_row_action_buttons(
-                                                        ui,
-                                                        item.kind,
-                                                        self.settings.theme,
-                                                    );
-                                                },
-                                            );
-                                        },
-                                    );
-                                });
-                            })
-                            .response
-                            .interact(egui::Sense::click());
+                        let row_size = egui::vec2(row_width, ROW_HEIGHT + 20.0);
+                        let (row_rect, response) =
+                            ui.allocate_exact_size(row_size, egui::Sense::click());
+                        ui.painter()
+                            .rect_filled(row_rect, CornerRadius::same(3), fill);
+                        ui.painter().rect_stroke(
+                            row_rect,
+                            CornerRadius::same(3),
+                            Stroke::new(1.0, hint_chip_stroke(self.settings.theme)),
+                            egui::StrokeKind::Inside,
+                        );
 
-                        if response.clicked() {
+                        let inner_rect = row_rect.shrink(10.0);
+                        ui.scope_builder(egui::UiBuilder::new().max_rect(inner_rect), |ui| {
+                            ui.set_min_size(inner_rect.size());
+                            ui.horizontal_top(|ui| {
+                                let action_response = show_item_action_button(
+                                    ui,
+                                    ctx,
+                                    &mut self.textures,
+                                    &data_dir,
+                                    &item,
+                                    self.settings.theme,
+                                );
+                                if action_response.clicked() {
+                                    self.run_item_action(&item, &data_dir, ctx);
+                                    ctx.request_repaint();
+                                }
+                                ui.add_space(8.0);
+                                let content_width = ui.available_width();
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(content_width, ROW_HEIGHT),
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| {
+                                        ui.spacing_mut().item_spacing.y = 2.0;
+                                        let text_color = if selected {
+                                            selected_text(self.settings.theme)
+                                        } else {
+                                            ui.visuals().text_color()
+                                        };
+                                        ui.add_sized(
+                                            egui::vec2(content_width, TEXT_PREVIEW_HEIGHT),
+                                            egui::Label::new(
+                                                RichText::new(&item.summary).color(text_color),
+                                            )
+                                            .wrap()
+                                            .halign(egui::Align::Min),
+                                        );
+                                        ui.add_sized(
+                                            egui::vec2(content_width, METADATA_HEIGHT),
+                                            egui::Label::new(
+                                                RichText::new(format!(
+                                                    "{} · {}",
+                                                    item.kind.label(),
+                                                    item.created_at.format("%H:%M:%S")
+                                                ))
+                                                .color(muted),
+                                            )
+                                            .truncate()
+                                            .halign(egui::Align::Min),
+                                        );
+                                        ui.allocate_ui_with_layout(
+                                            egui::vec2(content_width, HINT_CHIP_HEIGHT),
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                row_action = show_row_action_buttons(
+                                                    ui,
+                                                    item.kind,
+                                                    self.settings.theme,
+                                                );
+                                            },
+                                        );
+                                    },
+                                );
+                            });
+                        });
+
+                        if let Some(action) = row_action {
                             self.selected = Some(item.id);
+                            self.run_row_action(action, &item, &data_dir, ctx);
+                            ctx.request_repaint();
+                        } else {
+                            if response.clicked() {
+                                self.selected = Some(item.id);
+                            }
+
+                            if response.double_clicked() {
+                                self.copy_and_paste_item(&item, &data_dir, ctx);
+                            }
                         }
 
                         if selected {
                             response.scroll_to_me(Some(egui::Align::Center));
-                        }
-
-                        if response.double_clicked() {
-                            self.copy_and_paste_item(&item, &data_dir, ctx);
-                        }
-                        if let Some(action) = row_action {
-                            self.run_row_action(action, &item, &data_dir, ctx);
-                            ctx.request_repaint();
                         }
                         ui.add_space(6.0);
                     }
@@ -1778,6 +1887,7 @@ fn show_row_action_buttons(
     if show_row_action_button(
         ui,
         ActionIcon::Share,
+        "Share",
         "S",
         "Share: copy this item ready to share",
         theme,
@@ -1789,36 +1899,62 @@ fn show_row_action_buttons(
 
     match kind {
         ClipKind::Text => {
-            if show_row_action_button(ui, ActionIcon::Copy, "C", "Copy without pasting", theme)
-                .clicked()
+            if show_row_action_button(
+                ui,
+                ActionIcon::Copy,
+                "Copy",
+                "C",
+                "Copy without pasting",
+                theme,
+            )
+            .clicked()
             {
                 action = Some(RowAction::Copy);
             }
         }
         ClipKind::Url => {
-            if show_row_action_button(ui, ActionIcon::Open, "O", "Open URL", theme).clicked() {
+            if show_row_action_button(ui, ActionIcon::Open, "Open", "O", "Open URL", theme)
+                .clicked()
+            {
                 action = Some(RowAction::Open);
             }
         }
         ClipKind::FilePath => {
-            if show_row_action_button(ui, ActionIcon::Finder, "F", "Reveal in Finder", theme)
-                .clicked()
+            if show_row_action_button(
+                ui,
+                ActionIcon::Finder,
+                "Finder",
+                "F",
+                "Reveal in Finder",
+                theme,
+            )
+            .clicked()
             {
                 action = Some(RowAction::Reveal);
             }
-            if show_row_action_button(ui, ActionIcon::Open, "O", "Open file", theme).clicked() {
+            if show_row_action_button(ui, ActionIcon::Open, "Open", "O", "Open file", theme)
+                .clicked()
+            {
                 action = Some(RowAction::Open);
             }
         }
         ClipKind::Email => {
-            if show_row_action_button(ui, ActionIcon::Email, "O", "Compose email", theme).clicked()
+            if show_row_action_button(ui, ActionIcon::Email, "Email", "O", "Compose email", theme)
+                .clicked()
             {
                 action = Some(RowAction::Open);
             }
         }
         ClipKind::Phone => {
-            if show_row_action_button(ui, ActionIcon::Phone, "O", "Open phone handler", theme)
-                .clicked()
+            if show_row_action_button(
+                ui,
+                ActionIcon::Phone,
+                "Call",
+                "O",
+                "Open phone handler",
+                theme,
+            )
+            .clicked()
             {
                 action = Some(RowAction::Open);
             }
@@ -1827,6 +1963,7 @@ fn show_row_action_buttons(
             if show_row_action_button(
                 ui,
                 ActionIcon::Preview,
+                "Preview",
                 "Right",
                 "Preview image; press again for 100%",
                 theme,
@@ -1841,6 +1978,7 @@ fn show_row_action_buttons(
     if show_row_action_button(
         ui,
         ActionIcon::Paste,
+        "Paste",
         "Enter",
         "Paste into the previous app",
         theme,
@@ -1868,6 +2006,7 @@ enum ActionIcon {
 fn show_row_action_button(
     ui: &mut egui::Ui,
     icon: ActionIcon,
+    label: &str,
     shortcut: &str,
     hover_text: &str,
     theme: ThemeMode,
@@ -1889,15 +2028,22 @@ fn show_row_action_button(
         egui::StrokeKind::Inside,
     );
     let icon_rect = egui::Rect::from_center_size(
-        egui::pos2(rect.center().x, rect.top() + 14.0),
-        egui::vec2(15.0, 15.0),
+        egui::pos2(rect.center().x, rect.top() + 12.0),
+        egui::vec2(14.0, 14.0),
     );
     draw_action_icon(ui.painter(), icon_rect, icon, muted_text(theme), 1.4);
     ui.painter().text(
-        egui::pos2(rect.center().x, rect.bottom() - 8.0),
+        egui::pos2(rect.center().x, rect.top() + 28.0),
+        egui::Align2::CENTER_CENTER,
+        label,
+        egui::FontId::proportional(10.0),
+        muted_text(theme),
+    );
+    ui.painter().text(
+        egui::pos2(rect.center().x, rect.bottom() - 7.0),
         egui::Align2::CENTER_CENTER,
         shortcut,
-        egui::FontId::proportional(9.5),
+        egui::FontId::proportional(8.5),
         muted_text(theme),
     );
     response.on_hover_text(hover_text)
@@ -2772,6 +2918,31 @@ mod tests {
         assert_eq!(store.items.len(), 2);
         assert_eq!(store.items[0].text.as_deref(), Some("second copied item"));
         assert_eq!(store.items[1].text.as_deref(), Some("first copied item"));
+
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn suppressed_copy_does_not_promote_existing_item() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "better-clipboard-suppressed-copy-test-{}",
+            Uuid::new_v4()
+        ));
+        let mut store = HistoryStore::new(data_dir.clone(), DEFAULT_HISTORY_LIMIT);
+
+        store.push(text_snapshot("first")).expect("push first item");
+        store
+            .push(text_snapshot("second"))
+            .expect("push second item");
+
+        let first_again = text_snapshot("first");
+        store.suppress_next_hash(first_again.hash());
+        store.push(first_again).expect("push suppressed item");
+
+        assert_eq!(store.items.len(), 2);
+        assert_eq!(store.items[0].text.as_deref(), Some("second"));
+        assert_eq!(store.items[1].text.as_deref(), Some("first"));
+        assert!(store.suppressed_hashes.is_empty());
 
         let _ = fs::remove_dir_all(data_dir);
     }

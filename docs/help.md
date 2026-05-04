@@ -12,7 +12,7 @@ Better Clipboard is a macOS clipboard history palette. It keeps recent text, URL
 
 When an item is selected with `Enter` or double-click, Better Clipboard puts that item on the clipboard, hides the palette, reactivates the app that was focused before Better Clipboard opened, and sends `Cmd+V`. If paste input is blocked by macOS permissions, the item remains on the clipboard so you can paste manually.
 
-Click an item's action button to run its default action:
+Click an item's left type tile to run its default action:
 
 - Text copies to the clipboard without pasting. That also moves the item to the top of the history so it behaves like the newest copied item.
 - URLs open in the default browser.
@@ -23,7 +23,7 @@ Click an item's action button to run its default action:
 
 The action button is separate from row activation. Pressing `Enter` or double-clicking any row still pastes that item into the previously active app.
 
-Each row includes compact hints for the selected item's useful actions, such as `O` to open a URL or file, `F` to reveal a file path in Finder, and `S` to copy the item ready for sharing.
+Each row also includes bottom-right action buttons for the selected item's useful actions, such as Paste/`Enter`, Copy/`C`, Open/`O`, Finder/`F`, Preview/`Right`, and Share/`S`.
 
 ## Shortcuts
 
@@ -38,10 +38,10 @@ Each row includes compact hints for the selected item's useful actions, such as 
 | `Up` / `Down` | Expand the list and move the selected item. |
 | `Right Arrow` | Open a 50% image preview, or zoom an open image preview to 100%. |
 | `Left Arrow` | Step an image preview back from 100% to 50%, or close it from 50%. |
-| `C` | Copy the selected item without pasting. |
+| `C` | Copy the selected item without pasting, then close the palette. |
 | `O` | Open the selected URL, file path, email address, or phone number. |
 | `F` | Reveal the selected file path in Finder. |
-| `S` | Copy the selected item so it is ready to share. |
+| `S` | Copy the selected item so it is ready to share, then close the palette. |
 | `Cmd+Down` | Expand the list. |
 | `Tab` | Expand the list. |
 | `Cmd+Up` | Collapse the list. |
@@ -64,7 +64,7 @@ Clicking into another app hides the palette.
 
 Better Clipboard recognizes:
 
-- Text: click the action button or press `S` to copy it without pasting.
+- Text: click the left type tile to copy it and move it to the top of history, or press `C` to copy it without moving it to the top.
 - URL: click the action button or press `O` to open it.
 - File path: click the action button or press `F` to reveal it in Finder; press `O` to open it.
 - Email: click the action button or press `O` to compose an email.
