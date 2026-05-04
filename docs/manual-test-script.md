@@ -1,6 +1,12 @@
 # Manual Test Script
 
-Use this script for release testing before filing issues.
+Use this script for release testing before filing issues. The current release candidate is acceptable for the core keyboard workflow even though layout polish and Share are still known issues.
+
+## Current Known Issues
+
+- Row layout needs polish around spacing, visual hierarchy, and action buttons.
+- The Share button and `S` shortcut are not reliable yet.
+- Use `C` as the current fallback for copying an item to the clipboard without pasting.
 
 ## Setup
 
@@ -24,6 +30,7 @@ Use this script for release testing before filing issues.
 - [ ] Confirm each row shows an action button.
 - [ ] Confirm clickable action buttons appear in the bottom-right of each row, with keyboard shortcuts underneath the icons.
 - [ ] Confirm image row tiles fill the row height.
+- [ ] Note any row spacing, clipping, alignment, or hierarchy issues for a GitHub layout issue.
 - [ ] Copy a test credit card number such as `4111 1111 1111 1111`.
 - [ ] Copy a test API key-shaped value such as `sk-proj-abcdefghijklmnopqrstuvwxyz123456`.
 - [ ] Confirm sensitive-looking values are masked in the row summary.
@@ -47,7 +54,7 @@ Use this script for release testing before filing issues.
 - [ ] Select a phone item and press `O`.
 - [ ] Confirm macOS opens the configured phone handler.
 - [ ] Select any item and press `S`.
-- [ ] Confirm it is copied to the clipboard ready to share, and the palette closes.
+- [ ] Known issue check: record whether Share copies the item, closes the palette, shifts focus, or does nothing.
 - [ ] Click the bottom-right `Paste` / `Enter` action on an item.
 - [ ] Confirm the item pastes into the original app.
 - [ ] Press `Cmd+Down` or `Tab` to expand the list.
@@ -84,7 +91,14 @@ Use this script for release testing before filing issues.
 - [ ] Reopen Better Clipboard and click the bottom-right `Copy` / `C` button on a non-newest text item.
 - [ ] Confirm the palette closes and the item is copied without moving to the top of history.
 - [ ] Reopen Better Clipboard and click the bottom-right `Share` / `S` button.
-- [ ] Confirm the palette closes and the selected item is on the clipboard.
+- [ ] Known issue check: record what happens. Do not block core workflow sign-off only on Share.
+
+## Known Issue Filing
+
+- [ ] File one GitHub issue for row layout problems, with screenshots and notes about window size, selected item type, and whether compact or expanded mode was used.
+- [ ] File one GitHub issue for Share behavior, with the exact item type, whether mouse or `S` was used, and what happened to focus and clipboard contents.
+- [ ] File separate issues for paste-focus problems, image-preview problems, install/startup problems, or permission problems.
+- [ ] Use the manual test report template if reporting a full pass/fail run.
 
 ## Image Preview
 
@@ -125,3 +139,4 @@ When filing an issue, include:
 - Whether Accessibility permission was granted.
 - Exact shortcut or click sequence.
 - Expected result and actual result.
+- Screenshots or screen recordings for visual/layout issues.

@@ -2,6 +2,12 @@
 
 Better Clipboard is a macOS clipboard history palette. It keeps recent text, URLs, file paths, email addresses, phone numbers, and images available from the menu bar and from global shortcuts.
 
+## Current Status
+
+The main device workflow is the supported path right now: open the palette, move through history with the keyboard, press `Enter`, and paste into the previously focused app.
+
+Known gaps remain. The row layout is still being refined, and the Share action is unreliable. Use `C` to copy an item to the clipboard when you need to move it elsewhere.
+
 ## Core Workflow
 
 1. Copy text, a URL, a file path, an email address, a phone number, or an image in any app.
@@ -23,7 +29,7 @@ Click an item's left type tile to run its default action:
 
 The action button is separate from row activation. Pressing `Enter` or double-clicking any row still pastes that item into the previously active app.
 
-Each row also includes bottom-right action buttons for the selected item's useful actions, such as Paste/`Enter`, Copy/`C`, Open/`O`, Finder/`F`, Preview/`Right`, and Share/`S`.
+Each row also includes bottom-right action buttons for the selected item's useful actions, such as Paste/`Enter`, Copy/`C`, Open/`O`, Finder/`F`, Preview/`Right`, and Share/`S`. Share is currently a known issue.
 
 ## Shortcuts
 
@@ -41,7 +47,7 @@ Each row also includes bottom-right action buttons for the selected item's usefu
 | `C` | Copy the selected item without pasting, then close the palette. |
 | `O` | Open the selected URL, file path, email address, or phone number. |
 | `F` | Reveal the selected file path in Finder. |
-| `S` | Copy the selected item so it is ready to share, then close the palette. |
+| `S` | Known issue: intended to copy the selected item for sharing, but not reliable yet. |
 | `Cmd+Down` | Expand the list. |
 | `Tab` | Expand the list. |
 | `Cmd+Up` | Collapse the list. |
@@ -126,3 +132,9 @@ If paste does not happen automatically, check System Settings > Privacy & Securi
 Better Clipboard uses `NSPasteboard.changeCount` rather than continuously reading the clipboard. macOS increments that counter when the pasteboard changes, so Better Clipboard polls the counter every 100 ms and only reads contents after a change.
 
 macOS does not expose a complete event queue of clipboard payloads. If another app writes several values extremely quickly between checks, only the newest available payload may be captured.
+
+## Known Issues
+
+- Row layout and action-button spacing still need polish.
+- Share is not release-ready. Use `C` to copy the selected item instead.
+- If automatic paste fails, the selected item should still be on the clipboard for manual `Cmd+V`.
