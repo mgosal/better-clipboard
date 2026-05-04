@@ -44,20 +44,22 @@ const DEFAULT_HISTORY_LIMIT: usize = 100;
 const MIN_HISTORY_LIMIT: usize = 10;
 const MAX_HISTORY_LIMIT: usize = 1_000;
 const COMPACT_VISIBLE_ITEMS: usize = 3;
-const ROW_HEIGHT: f32 = 58.0;
-const THUMBNAIL_SIZE: f32 = 42.0;
+const ROW_HEIGHT: f32 = 104.0;
+const THUMBNAIL_SIZE: f32 = 58.0;
+const TEXT_PREVIEW_HEIGHT: f32 = 42.0;
+const METADATA_HEIGHT: f32 = 20.0;
 const PREVIEW_SCALE: f32 = 0.5;
 const PREVIEW_MAX_IMAGE_WIDTH: f32 = 1_280.0;
 const PREVIEW_MAX_IMAGE_HEIGHT: f32 = 900.0;
-const HINT_CHIP_WIDTH: f32 = 22.0;
-const HINT_CHIP_HEIGHT: f32 = 18.0;
-const HINT_CHIP_GAP: f32 = 4.0;
+const HINT_CHIP_WIDTH: f32 = 26.0;
+const HINT_CHIP_HEIGHT: f32 = 22.0;
+const HINT_CHIP_GAP: f32 = 5.0;
 const FOCUS_HIDE_GRACE: Duration = Duration::from_millis(180);
 const CHANGE_COUNT_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 const PASTE_DELAY: Duration = Duration::from_millis(140);
 const PERMISSION_PROMPT_DELAY: Duration = Duration::from_millis(700);
-const COMPACT_HEIGHT: f32 = 286.0;
-const EXPANDED_HEIGHT: f32 = 560.0;
+const COMPACT_HEIGHT: f32 = 432.0;
+const EXPANDED_HEIGHT: f32 = 720.0;
 const SETTINGS_HEIGHT: f32 = 300.0;
 const APP_NAME: &str = "Better Clipboard";
 const LAUNCH_AGENT_LABEL: &str = "com.mgosal.better-clipboard";
@@ -1454,52 +1456,47 @@ impl eframe::App for BetterClipboardApp {
                                         ctx.request_repaint();
                                     }
                                     ui.add_space(8.0);
-                                    ui.with_layout(
+                                    let content_width = ui.available_width();
+                                    ui.allocate_ui_with_layout(
+                                        egui::vec2(content_width, ROW_HEIGHT),
                                         egui::Layout::top_down(egui::Align::Min),
                                         |ui| {
-                                            ui.set_width(ui.available_width());
+                                            ui.spacing_mut().item_spacing.y = 2.0;
                                             let text_color = if selected {
                                                 selected_text(self.settings.theme)
                                             } else {
                                                 ui.visuals().text_color()
                                             };
-                                            ui.add(
+                                            ui.add_sized(
+                                                egui::vec2(content_width, TEXT_PREVIEW_HEIGHT),
                                                 egui::Label::new(
                                                     RichText::new(&item.summary).color(text_color),
                                                 )
+                                                .wrap(),
+                                            );
+                                            ui.add_sized(
+                                                egui::vec2(content_width, METADATA_HEIGHT),
+                                                egui::Label::new(
+                                                    RichText::new(format!(
+                                                        "{} · {}",
+                                                        item.kind.label(),
+                                                        item.created_at.format("%H:%M:%S")
+                                                    ))
+                                                    .color(muted),
+                                                )
                                                 .truncate(),
                                             );
-                                            ui.horizontal(|ui| {
-                                                let hint_width = row_hint_width(item.kind);
-                                                let meta_width =
-                                                    (ui.available_width() - hint_width - 8.0)
-                                                        .max(80.0);
-                                                ui.add_sized(
-                                                    egui::vec2(meta_width, HINT_CHIP_HEIGHT),
-                                                    egui::Label::new(
-                                                        RichText::new(format!(
-                                                            "{} · {}",
-                                                            item.kind.label(),
-                                                            item.created_at.format("%H:%M:%S")
-                                                        ))
-                                                        .color(muted),
-                                                    )
-                                                    .truncate(),
-                                                );
-                                                ui.allocate_ui_with_layout(
-                                                    egui::vec2(hint_width, HINT_CHIP_HEIGHT),
-                                                    egui::Layout::right_to_left(
-                                                        egui::Align::Center,
-                                                    ),
-                                                    |ui| {
-                                                        show_row_hints(
-                                                            ui,
-                                                            item.kind,
-                                                            self.settings.theme,
-                                                        );
-                                                    },
-                                                );
-                                            });
+                                            ui.allocate_ui_with_layout(
+                                                egui::vec2(content_width, HINT_CHIP_HEIGHT),
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    show_row_hints(
+                                                        ui,
+                                                        item.kind,
+                                                        self.settings.theme,
+                                                    );
+                                                },
+                                            );
                                         },
                                     );
                                 });
@@ -1728,34 +1725,48 @@ fn thumbnail_background(theme: ThemeMode) -> Color32 {
     }
 }
 
-fn row_hint_width(kind: ClipKind) -> f32 {
-    let count = match kind {
-        ClipKind::FilePath => 4.0,
-        _ => 3.0,
-    };
-    count * HINT_CHIP_WIDTH + (count - 1.0) * HINT_CHIP_GAP
-}
-
 fn show_row_hints(ui: &mut egui::Ui, kind: ClipKind, theme: ThemeMode) {
     ui.spacing_mut().item_spacing.x = HINT_CHIP_GAP;
-    show_hint_chip(ui, "S", "Share: copy this item ready to share", theme);
+    show_hint_chip(
+        ui,
+        ActionIcon::Share,
+        "Share: copy this item ready to share",
+        theme,
+    );
 
     match kind {
-        ClipKind::Text => show_hint_chip(ui, "⧉", "Click the tile: copy without pasting", theme),
-        ClipKind::Url => show_hint_chip(ui, "O", "Open URL", theme),
+        ClipKind::Text => show_hint_chip(ui, ActionIcon::Copy, "Copy without pasting", theme),
+        ClipKind::Url => show_hint_chip(ui, ActionIcon::Open, "Open URL", theme),
         ClipKind::FilePath => {
-            show_hint_chip(ui, "F", "Reveal in Finder", theme);
-            show_hint_chip(ui, "O", "Open file", theme);
+            show_hint_chip(ui, ActionIcon::Finder, "Reveal in Finder", theme);
+            show_hint_chip(ui, ActionIcon::Open, "Open file", theme);
         }
-        ClipKind::Email => show_hint_chip(ui, "O", "Compose email", theme),
-        ClipKind::Phone => show_hint_chip(ui, "O", "Open phone handler", theme),
-        ClipKind::Image => show_hint_chip(ui, "→", "Preview image; press again for 100%", theme),
+        ClipKind::Email => show_hint_chip(ui, ActionIcon::Email, "Compose email", theme),
+        ClipKind::Phone => show_hint_chip(ui, ActionIcon::Phone, "Open phone handler", theme),
+        ClipKind::Image => show_hint_chip(
+            ui,
+            ActionIcon::Preview,
+            "Preview image; press again for 100%",
+            theme,
+        ),
     }
 
-    show_hint_chip(ui, "↵", "Paste into the previous app", theme);
+    show_hint_chip(ui, ActionIcon::Paste, "Paste into the previous app", theme);
 }
 
-fn show_hint_chip(ui: &mut egui::Ui, label: &str, hover_text: &str, theme: ThemeMode) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActionIcon {
+    Copy,
+    Open,
+    Finder,
+    Email,
+    Phone,
+    Preview,
+    Paste,
+    Share,
+}
+
+fn show_hint_chip(ui: &mut egui::Ui, icon: ActionIcon, hover_text: &str, theme: ThemeMode) {
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(HINT_CHIP_WIDTH, HINT_CHIP_HEIGHT),
         egui::Sense::hover(),
@@ -1768,13 +1779,7 @@ fn show_hint_chip(ui: &mut egui::Ui, label: &str, hover_text: &str, theme: Theme
         Stroke::new(1.0, hint_chip_stroke(theme)),
         egui::StrokeKind::Inside,
     );
-    ui.painter().text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        label,
-        egui::FontId::proportional(11.0),
-        muted_text(theme),
-    );
+    draw_action_icon(ui.painter(), rect.shrink(5.0), icon, muted_text(theme), 1.4);
     response.on_hover_text(hover_text);
 }
 
@@ -1789,6 +1794,198 @@ fn hint_chip_stroke(theme: ThemeMode) -> Color32 {
     match theme {
         ThemeMode::Light => Color32::from_rgb(205, 205, 202),
         ThemeMode::Dark => Color32::from_rgb(70, 70, 70),
+    }
+}
+
+fn draw_action_icon(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    icon: ActionIcon,
+    color: Color32,
+    stroke_width: f32,
+) {
+    let stroke = Stroke::new(stroke_width, color);
+    match icon {
+        ActionIcon::Copy => {
+            let back = egui::Rect::from_min_size(
+                rect.left_top() + egui::vec2(rect.width() * 0.24, 0.0),
+                rect.size() * 0.62,
+            );
+            let front = egui::Rect::from_min_size(
+                rect.left_top() + egui::vec2(0.0, rect.height() * 0.22),
+                rect.size() * 0.68,
+            );
+            painter.rect_stroke(
+                back,
+                CornerRadius::same(2),
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            painter.rect_stroke(
+                front,
+                CornerRadius::same(2),
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+        }
+        ActionIcon::Open => {
+            let start = egui::pos2(
+                rect.left() + rect.width() * 0.22,
+                rect.bottom() - rect.height() * 0.22,
+            );
+            let end = egui::pos2(
+                rect.right() - rect.width() * 0.18,
+                rect.top() + rect.height() * 0.18,
+            );
+            painter.line_segment([start, end], stroke);
+            painter.line_segment(
+                [
+                    end,
+                    egui::pos2(end.x - rect.width() * 0.38, end.y + rect.height() * 0.02),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    end,
+                    egui::pos2(end.x - rect.width() * 0.02, end.y + rect.height() * 0.38),
+                ],
+                stroke,
+            );
+        }
+        ActionIcon::Finder => {
+            let tab_left = egui::pos2(rect.left(), rect.top() + rect.height() * 0.34);
+            let tab_top = egui::pos2(
+                rect.left() + rect.width() * 0.28,
+                rect.top() + rect.height() * 0.18,
+            );
+            let tab_right = egui::pos2(
+                rect.left() + rect.width() * 0.48,
+                rect.top() + rect.height() * 0.34,
+            );
+            let points = [
+                tab_left,
+                tab_top,
+                tab_right,
+                egui::pos2(rect.right(), rect.top() + rect.height() * 0.34),
+                rect.right_bottom(),
+                rect.left_bottom(),
+                tab_left,
+            ];
+            for pair in points.windows(2) {
+                painter.line_segment([pair[0], pair[1]], stroke);
+            }
+        }
+        ActionIcon::Email => {
+            painter.rect_stroke(
+                rect,
+                CornerRadius::same(2),
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            painter.line_segment([rect.left_top(), rect.center()], stroke);
+            painter.line_segment([rect.right_top(), rect.center()], stroke);
+            painter.line_segment([rect.left_bottom(), rect.center()], stroke);
+            painter.line_segment([rect.right_bottom(), rect.center()], stroke);
+        }
+        ActionIcon::Phone => {
+            let points = [
+                egui::pos2(
+                    rect.left() + rect.width() * 0.18,
+                    rect.top() + rect.height() * 0.28,
+                ),
+                egui::pos2(
+                    rect.left() + rect.width() * 0.34,
+                    rect.top() + rect.height() * 0.18,
+                ),
+                egui::pos2(
+                    rect.left() + rect.width() * 0.48,
+                    rect.top() + rect.height() * 0.40,
+                ),
+                egui::pos2(
+                    rect.left() + rect.width() * 0.60,
+                    rect.top() + rect.height() * 0.54,
+                ),
+                egui::pos2(
+                    rect.left() + rect.width() * 0.82,
+                    rect.top() + rect.height() * 0.66,
+                ),
+                egui::pos2(
+                    rect.left() + rect.width() * 0.70,
+                    rect.top() + rect.height() * 0.84,
+                ),
+            ];
+            for pair in points.windows(2) {
+                painter.line_segment([pair[0], pair[1]], stroke);
+            }
+        }
+        ActionIcon::Preview => {
+            let radius = rect.width().min(rect.height()) * 0.28;
+            let center = rect.center() - egui::vec2(rect.width() * 0.08, rect.height() * 0.08);
+            painter.circle_stroke(center, radius, stroke);
+            painter.line_segment(
+                [
+                    center + egui::vec2(radius * 0.72, radius * 0.72),
+                    rect.right_bottom(),
+                ],
+                stroke,
+            );
+        }
+        ActionIcon::Paste => {
+            let top = egui::pos2(
+                rect.right() - rect.width() * 0.16,
+                rect.top() + rect.height() * 0.18,
+            );
+            let mid = egui::pos2(top.x, rect.center().y);
+            let left = egui::pos2(rect.left() + rect.width() * 0.22, mid.y);
+            painter.line_segment([top, mid], stroke);
+            painter.line_segment([mid, left], stroke);
+            painter.line_segment(
+                [
+                    left,
+                    left + egui::vec2(rect.width() * 0.22, -rect.height() * 0.18),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    left,
+                    left + egui::vec2(rect.width() * 0.22, rect.height() * 0.18),
+                ],
+                stroke,
+            );
+        }
+        ActionIcon::Share => {
+            let box_top = rect.top() + rect.height() * 0.50;
+            let box_rect = egui::Rect::from_min_max(
+                egui::pos2(rect.left() + rect.width() * 0.16, box_top),
+                egui::pos2(
+                    rect.right() - rect.width() * 0.16,
+                    rect.bottom() - rect.height() * 0.08,
+                ),
+            );
+            painter.line_segment([box_rect.left_top(), box_rect.left_bottom()], stroke);
+            painter.line_segment([box_rect.left_bottom(), box_rect.right_bottom()], stroke);
+            painter.line_segment([box_rect.right_bottom(), box_rect.right_top()], stroke);
+
+            let arrow_top = egui::pos2(rect.center().x, rect.top() + rect.height() * 0.08);
+            let arrow_bottom = egui::pos2(rect.center().x, rect.bottom() - rect.height() * 0.28);
+            painter.line_segment([arrow_bottom, arrow_top], stroke);
+            painter.line_segment(
+                [
+                    arrow_top,
+                    arrow_top + egui::vec2(-rect.width() * 0.18, rect.height() * 0.20),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    arrow_top,
+                    arrow_top + egui::vec2(rect.width() * 0.18, rect.height() * 0.20),
+                ],
+                stroke,
+            );
+        }
     }
 }
 
@@ -1837,13 +2034,13 @@ fn show_item_action_button(
         }
     }
 
-    let glyph = match item.kind {
-        ClipKind::Text => "⧉",
-        ClipKind::Url => "↗",
-        ClipKind::FilePath => "F",
-        ClipKind::Email => "@",
-        ClipKind::Phone => "☎",
-        ClipKind::Image => "▧",
+    let icon = match item.kind {
+        ClipKind::Text => ActionIcon::Copy,
+        ClipKind::Url => ActionIcon::Open,
+        ClipKind::FilePath => ActionIcon::Finder,
+        ClipKind::Email => ActionIcon::Email,
+        ClipKind::Phone => ActionIcon::Phone,
+        ClipKind::Image => ActionIcon::Preview,
     };
     let hover_text = match item.kind {
         ClipKind::Text => "Copy text to clipboard",
@@ -1853,12 +2050,12 @@ fn show_item_action_button(
         ClipKind::Phone => "Open phone handler",
         ClipKind::Image => "Preview image",
     };
-    ui.painter().text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        glyph,
-        egui::FontId::proportional(18.0),
+    draw_action_icon(
+        ui.painter(),
+        rect.shrink(13.0),
+        icon,
         muted_text(theme),
+        1.8,
     );
     response.on_hover_text(hover_text)
 }
