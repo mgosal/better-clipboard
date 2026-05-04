@@ -13,11 +13,17 @@ Use this script for release testing before filing issues.
 
 - [ ] Copy plain text from any app.
 - [ ] Copy a URL.
+- [ ] Copy an existing local file path.
+- [ ] Copy an email address.
+- [ ] Copy a phone number.
 - [ ] Copy an image.
 - [ ] Open Better Clipboard with `Option+Space`.
 - [ ] Confirm all copied items appear in newest-first order.
-- [ ] Confirm text and URL rows are left-aligned.
+- [ ] Confirm text, URL, file, email, and phone rows are left-aligned.
 - [ ] Confirm each row shows an action button.
+- [ ] Copy a test credit card number such as `4111 1111 1111 1111`.
+- [ ] Copy a test API key-shaped value such as `sk-proj-abcdefghijklmnopqrstuvwxyz123456`.
+- [ ] Confirm sensitive-looking values are masked in the row summary.
 
 ## Keyboard Navigation
 
@@ -25,6 +31,18 @@ Use this script for release testing before filing issues.
 - [ ] Confirm the selected row stays visible as the list scrolls.
 - [ ] Press `Up` repeatedly.
 - [ ] Confirm the selected row stays visible while moving upward.
+- [ ] Select a URL item and press `O`.
+- [ ] Confirm the URL opens in the default browser.
+- [ ] Select a file path item and press `O`.
+- [ ] Confirm the file opens.
+- [ ] Select a file path item and press `F`.
+- [ ] Confirm Finder reveals the file.
+- [ ] Select an email item and press `O`.
+- [ ] Confirm the default mail app opens a composer.
+- [ ] Select a phone item and press `O`.
+- [ ] Confirm macOS opens the configured phone handler.
+- [ ] Select any item and press `S`.
+- [ ] Confirm it is copied to the clipboard ready to share.
 - [ ] Press `Cmd+Down` or `Tab` to expand the list.
 - [ ] Press `Cmd+Up` to collapse the list.
 - [ ] Press `Escape` and confirm the palette closes without changing the clipboard.
@@ -48,6 +66,12 @@ Use this script for release testing before filing issues.
 - [ ] Paste manually with `Cmd+V` and confirm the copied value is correct.
 - [ ] Click the URL action button on a URL item.
 - [ ] Confirm the URL opens in the default browser.
+- [ ] Click the file path action button on a file item.
+- [ ] Confirm Finder reveals the file.
+- [ ] Click the email action button on an email item.
+- [ ] Confirm the default mail app opens a composer.
+- [ ] Click the phone action button on a phone item.
+- [ ] Confirm macOS opens the configured phone handler.
 - [ ] Click the image action button on an image item.
 - [ ] Confirm the image preview opens.
 

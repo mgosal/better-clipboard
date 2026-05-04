@@ -2,13 +2,15 @@
 
 Better Clipboard is a small macOS clipboard history app written in Rust.
 
-It watches `NSPasteboard.changeCount` and only reads clipboard contents when macOS reports a change. Text, URLs, and images are stored locally, and the palette can be opened with `Option+Space`, `Cmd+Option+Space`, `Cmd+Option+\`, or from the 📋 menu bar icon.
+It watches `NSPasteboard.changeCount` and only reads clipboard contents when macOS reports a change. Text, URLs, file paths, email addresses, phone numbers, and images are stored locally, and the palette can be opened with `Option+Space`, `Cmd+Option+Space`, `Cmd+Option+\`, or from the 📋 menu bar icon.
 
 Escape, pressing the shortcut again, or clicking into another app cancels the palette without copying or pasting. Use the menu bar icon's Quit item to exit the app.
 
 When the palette opens, the newest item is selected. Press Enter or double-click an item to copy it, hide Better Clipboard, reactivate the app that was focused before the palette opened, and send `Cmd+V`. If macOS blocks the synthetic paste event, the item is still on the clipboard.
 
-Click an item's action button to run its default action: text copies to the clipboard, URLs open in the default browser, and images open a larger floating preview. This does not change row behavior: pressing `Enter` or double-clicking any text, URL, or image row still pastes that item into the previously active app. For image items, `Right Arrow` also opens the preview; `Escape` closes the preview and `Enter` pastes the image.
+Click an item's action button to run its default action: text copies to the clipboard, URLs open in the default browser, file paths reveal in Finder, email addresses open a mail composer, phone numbers open the system phone handler, and images open a larger floating preview. This does not change row behavior: pressing `Enter` or double-clicking any row still pastes that item into the previously active app. For type-specific keyboard actions, use `O` to open URL/file/email/phone items, `F` to reveal file paths in Finder, and `S` to copy the selected item ready for sharing.
+
+Sensitive-looking values such as Luhn-valid credit card numbers and common API key formats are masked in the palette display. The original value is still kept as the clipboard payload so paste, copy, and share-prep actions work correctly.
 
 macOS does not expose an event queue of past clipboard contents, so very rapid clipboard changes can still collapse to the newest available payload. Better Clipboard checks the change counter every 100 ms to catch normal copy flows without continuously reading clipboard contents.
 
@@ -22,6 +24,9 @@ macOS does not expose an event queue of past clipboard contents, so very rapid c
 - `Escape`: cancel without changing the clipboard.
 - `Up` / `Down`: expand the list and move selection.
 - `Right Arrow`: preview the selected image item.
+- `O`: open the selected URL, file path, email address, or phone number.
+- `F`: reveal the selected file path in Finder.
+- `S`: copy the selected item so it is ready to share.
 - `Cmd+Down` or `Tab`: expand the list.
 - `Cmd+Up`: collapse the list.
 

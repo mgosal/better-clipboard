@@ -427,11 +427,18 @@ impl HistoryStore {
         let mut items: Vec<ClipItem> =
             serde_json::from_slice(&bytes).context("parse history file")?;
         items.truncate(max_items);
-        Ok(Self {
+        let changed = items.iter_mut().fold(false, |changed, item| {
+            normalize_loaded_item(item) || changed
+        });
+        let store = Self {
             data_dir,
             max_items,
             items,
-        })
+        };
+        if changed {
+            store.save().context("save normalized history")?;
+        }
+        Ok(store)
     }
 
     fn push(&mut self, snapshot: ClipboardSnapshot) -> Result<()> {
@@ -539,16 +546,12 @@ struct ClipItem {
 
 impl ClipItem {
     fn from_text(text: String, hash: String) -> Self {
-        let kind = if Url::parse(text.trim()).is_ok() {
-            ClipKind::Url
-        } else {
-            ClipKind::Text
-        };
+        let kind = classify_text(&text);
 
         Self {
             id: Uuid::new_v4(),
             kind,
-            summary: summarize_text(&text),
+            summary: summary_for_text(&text),
             text: Some(text),
             image: None,
             created_at: Local::now(),
@@ -561,6 +564,9 @@ impl ClipItem {
 enum ClipKind {
     Text,
     Url,
+    FilePath,
+    Email,
+    Phone,
     Image,
 }
 
@@ -569,6 +575,9 @@ impl ClipKind {
         match self {
             Self::Text => "Text",
             Self::Url => "URL",
+            Self::FilePath => "File",
+            Self::Email => "Email",
+            Self::Phone => "Phone",
             Self::Image => "Image",
         }
     }
@@ -855,14 +864,36 @@ impl BetterClipboardApp {
             ClipKind::Url => {
                 self.open_url(item, ctx);
             }
+            ClipKind::FilePath => {
+                self.reveal_file_in_finder(item, ctx);
+            }
+            ClipKind::Email => {
+                self.open_email(item, ctx);
+            }
+            ClipKind::Phone => {
+                self.open_phone(item, ctx);
+            }
             ClipKind::Image => {
                 self.open_image_preview(item, ctx);
             }
         }
     }
 
+    fn open_item(&mut self, item: &ClipItem, data_dir: &Path, ctx: &egui::Context) {
+        match item.kind {
+            ClipKind::Text => {
+                self.copy_item(item, data_dir);
+            }
+            ClipKind::Url => self.open_url(item, ctx),
+            ClipKind::FilePath => self.open_file_path(item, ctx),
+            ClipKind::Email => self.open_email(item, ctx),
+            ClipKind::Phone => self.open_phone(item, ctx),
+            ClipKind::Image => self.open_image_preview(item, ctx),
+        }
+    }
+
     fn open_url(&mut self, item: &ClipItem, ctx: &egui::Context) {
-        let Some(url) = item.text.as_deref() else {
+        let Some(url) = item.text.as_deref().map(str::trim) else {
             self.status = "Open URL failed: missing URL payload".to_owned();
             return;
         };
@@ -872,14 +903,110 @@ impl BetterClipboardApp {
             return;
         }
 
-        match Command::new("open").arg(url).spawn() {
+        self.open_with_macos(url, "Opened URL", "Open URL failed", Some(item.id), ctx);
+    }
+
+    fn open_file_path(&mut self, item: &ClipItem, ctx: &egui::Context) {
+        let Some(path) = item.text.as_deref().and_then(file_path_from_text) else {
+            self.status = "Open file failed: file path is unavailable".to_owned();
+            return;
+        };
+        self.open_path_with_macos(path, "Opened file", "Open file failed", Some(item.id), ctx);
+    }
+
+    fn reveal_file_in_finder(&mut self, item: &ClipItem, ctx: &egui::Context) {
+        let Some(path) = item.text.as_deref().and_then(file_path_from_text) else {
+            self.status = "Reveal failed: file path is unavailable".to_owned();
+            return;
+        };
+
+        match Command::new("open").arg("-R").arg(path).spawn() {
             Ok(_) => {
-                self.status = "Opened URL".to_owned();
+                self.status = "Revealed in Finder".to_owned();
                 self.selected = Some(item.id);
                 self.hide_window(ctx);
             }
             Err(err) => {
-                self.status = format!("Open URL failed: {err}");
+                self.status = format!("Reveal failed: {err}");
+            }
+        }
+    }
+
+    fn open_email(&mut self, item: &ClipItem, ctx: &egui::Context) {
+        let Some(email) = item.text.as_deref().map(str::trim) else {
+            self.status = "Open email failed: missing email payload".to_owned();
+            return;
+        };
+        if !is_email_address(email) {
+            self.status = "Open email failed: invalid email address".to_owned();
+            return;
+        }
+        let target = format!("mailto:{email}");
+        self.open_with_macos(
+            &target,
+            "Opened email composer",
+            "Open email failed",
+            Some(item.id),
+            ctx,
+        );
+    }
+
+    fn open_phone(&mut self, item: &ClipItem, ctx: &egui::Context) {
+        let Some(phone) = item.text.as_deref().and_then(phone_url) else {
+            self.status = "Open phone failed: invalid phone number".to_owned();
+            return;
+        };
+        self.open_with_macos(
+            &phone,
+            "Opened phone handler",
+            "Open phone failed",
+            Some(item.id),
+            ctx,
+        );
+    }
+
+    fn share_item(&mut self, item: &ClipItem, data_dir: &Path) {
+        if self.copy_item(item, data_dir) {
+            self.status = format!("Copied {} for sharing", item.kind.label().to_lowercase());
+        }
+    }
+
+    fn open_with_macos(
+        &mut self,
+        target: &str,
+        success: &str,
+        failure: &str,
+        selected: Option<Uuid>,
+        ctx: &egui::Context,
+    ) {
+        match Command::new("open").arg(target).spawn() {
+            Ok(_) => {
+                self.status = success.to_owned();
+                self.selected = selected;
+                self.hide_window(ctx);
+            }
+            Err(err) => {
+                self.status = format!("{failure}: {err}");
+            }
+        }
+    }
+
+    fn open_path_with_macos(
+        &mut self,
+        path: PathBuf,
+        success: &str,
+        failure: &str,
+        selected: Option<Uuid>,
+        ctx: &egui::Context,
+    ) {
+        match Command::new("open").arg(path).spawn() {
+            Ok(_) => {
+                self.status = success.to_owned();
+                self.selected = selected;
+                self.hide_window(ctx);
+            }
+            Err(err) => {
+                self.status = format!("{failure}: {err}");
             }
         }
     }
@@ -923,6 +1050,9 @@ impl BetterClipboardApp {
         let enter = ctx.input(|input| input.key_pressed(Key::Enter));
         let escape = ctx.input(|input| input.key_pressed(Key::Escape));
         let right = ctx.input(|input| input.key_pressed(Key::ArrowRight));
+        let open = ctx.input(|input| input.key_pressed(Key::O));
+        let finder = ctx.input(|input| input.key_pressed(Key::F));
+        let share = ctx.input(|input| input.key_pressed(Key::S));
 
         if escape {
             if self.preview_item.is_some() {
@@ -937,6 +1067,11 @@ impl BetterClipboardApp {
             if enter {
                 if let Some(index) = self.selected_index(visible_items) {
                     self.copy_and_paste_item(&visible_items[index], data_dir, ctx);
+                }
+            }
+            if share {
+                if let Some(index) = self.selected_index(visible_items) {
+                    self.share_item(&visible_items[index], data_dir);
                 }
             }
             return;
@@ -967,6 +1102,23 @@ impl BetterClipboardApp {
         if right {
             if let Some(index) = self.selected_index(visible_items) {
                 self.open_image_preview(&visible_items[index], ctx);
+            }
+        }
+        if open {
+            if let Some(index) = self.selected_index(visible_items) {
+                self.open_item(&visible_items[index], data_dir, ctx);
+            }
+        }
+        if finder {
+            if let Some(index) = self.selected_index(visible_items) {
+                if visible_items[index].kind == ClipKind::FilePath {
+                    self.reveal_file_in_finder(&visible_items[index], ctx);
+                }
+            }
+        }
+        if share {
+            if let Some(index) = self.selected_index(visible_items) {
+                self.share_item(&visible_items[index], data_dir);
             }
         }
         if enter {
@@ -1226,9 +1378,10 @@ impl eframe::App for BetterClipboardApp {
                                             ui.add(
                                                 egui::Label::new(
                                                     RichText::new(format!(
-                                                        "{} · {}",
+                                                        "{} · {} · {}",
                                                         item.kind.label(),
-                                                        item.created_at.format("%H:%M:%S")
+                                                        item.created_at.format("%H:%M:%S"),
+                                                        item_hint(&item)
                                                     ))
                                                     .color(muted),
                                                 )
@@ -1478,6 +1631,17 @@ fn thumbnail_background(theme: ThemeMode) -> Color32 {
     }
 }
 
+fn item_hint(item: &ClipItem) -> &'static str {
+    match item.kind {
+        ClipKind::Text => "Enter paste · click copy · S share",
+        ClipKind::Url => "Enter paste · click/O open · S share",
+        ClipKind::FilePath => "Enter paste · click/F Finder · O open · S share",
+        ClipKind::Email => "Enter paste · click/O compose · S share",
+        ClipKind::Phone => "Enter paste · click/O call · S share",
+        ClipKind::Image => "Enter paste · click/Right preview · S share",
+    }
+}
+
 fn show_item_action_button(
     ui: &mut egui::Ui,
     ctx: &egui::Context,
@@ -1526,11 +1690,17 @@ fn show_item_action_button(
     let glyph = match item.kind {
         ClipKind::Text => "⧉",
         ClipKind::Url => "↗",
+        ClipKind::FilePath => "F",
+        ClipKind::Email => "@",
+        ClipKind::Phone => "☎",
         ClipKind::Image => "▧",
     };
     let hover_text = match item.kind {
         ClipKind::Text => "Copy text to clipboard",
         ClipKind::Url => "Open URL",
+        ClipKind::FilePath => "Reveal in Finder",
+        ClipKind::Email => "Compose email",
+        ClipKind::Phone => "Open phone handler",
         ClipKind::Image => "Preview image",
     };
     ui.painter().text(
@@ -1575,7 +1745,7 @@ fn load_color_image(path: &Path) -> Result<egui::ColorImage> {
 fn copy_item_to_clipboard(item: &ClipItem, data_dir: &Path) -> Result<()> {
     let mut clipboard = Clipboard::new().context("open clipboard")?;
     match item.kind {
-        ClipKind::Text | ClipKind::Url => {
+        ClipKind::Text | ClipKind::Url | ClipKind::FilePath | ClipKind::Email | ClipKind::Phone => {
             let text = item.text.as_deref().context("missing text payload")?;
             clipboard
                 .set_text(text.to_owned())
@@ -1718,6 +1888,360 @@ fn xml_escape(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+fn normalize_loaded_item(item: &mut ClipItem) -> bool {
+    if let Some(text) = item.text.as_deref() {
+        let kind = classify_text(text);
+        let summary = summary_for_text(text);
+        let changed = item.kind != kind || item.summary != summary;
+        item.kind = kind;
+        item.summary = summary;
+        return changed;
+    }
+
+    if item.image.is_some() && item.kind != ClipKind::Image {
+        item.kind = ClipKind::Image;
+        return true;
+    }
+
+    false
+}
+
+fn summary_for_text(text: &str) -> String {
+    summarize_text(&mask_sensitive_text(text))
+}
+
+fn classify_text(text: &str) -> ClipKind {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return ClipKind::Text;
+    }
+
+    if file_path_from_text(trimmed).is_some() {
+        ClipKind::FilePath
+    } else if Url::parse(trimmed).is_ok() {
+        ClipKind::Url
+    } else if is_email_address(trimmed) {
+        ClipKind::Email
+    } else if is_phone_number(trimmed) {
+        ClipKind::Phone
+    } else {
+        ClipKind::Text
+    }
+}
+
+fn file_path_from_text(text: &str) -> Option<PathBuf> {
+    let trimmed = strip_wrapping_quotes(text.trim());
+    if trimmed.is_empty() || trimmed.contains('\n') || trimmed.contains('\r') {
+        return None;
+    }
+
+    if let Ok(url) = Url::parse(trimmed) {
+        if url.scheme() == "file" {
+            let path = url.to_file_path().ok()?;
+            return path.exists().then_some(path);
+        }
+    }
+
+    let path = if trimmed == "~" {
+        PathBuf::from(env::var_os("HOME")?)
+    } else if let Some(rest) = trimmed.strip_prefix("~/") {
+        PathBuf::from(env::var_os("HOME")?).join(rest)
+    } else {
+        PathBuf::from(trimmed)
+    };
+
+    let candidate = if path.is_absolute() {
+        path
+    } else if trimmed.starts_with("./") || trimmed.starts_with("../") {
+        env::current_dir().ok()?.join(path)
+    } else {
+        return None;
+    };
+
+    candidate.exists().then_some(candidate)
+}
+
+fn strip_wrapping_quotes(value: &str) -> &str {
+    if value.len() < 2 {
+        return value;
+    }
+
+    let quoted = (value.starts_with('"') && value.ends_with('"'))
+        || (value.starts_with('\'') && value.ends_with('\''));
+    if quoted {
+        &value[1..value.len() - 1]
+    } else {
+        value
+    }
+}
+
+fn is_email_address(value: &str) -> bool {
+    if value.contains(char::is_whitespace) {
+        return false;
+    }
+
+    let Some((local, domain)) = value.split_once('@') else {
+        return false;
+    };
+    if local.is_empty()
+        || domain.is_empty()
+        || domain.starts_with('.')
+        || domain.ends_with('.')
+        || !domain.contains('.')
+    {
+        return false;
+    }
+
+    let local_ok = local
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '%' | '+' | '-'));
+    let domain_ok = domain
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-'));
+    local_ok && domain_ok
+}
+
+fn is_phone_number(value: &str) -> bool {
+    if contains_luhn_card_number(value) || value.contains('\n') || value.contains('\r') {
+        return false;
+    }
+
+    let mut digits = 0;
+    let mut seen_plus = false;
+    for (index, ch) in value.trim().chars().enumerate() {
+        if ch.is_ascii_digit() {
+            digits += 1;
+        } else if ch == '+' {
+            if index != 0 || seen_plus {
+                return false;
+            }
+            seen_plus = true;
+        } else if !matches!(ch, ' ' | '-' | '.' | '(' | ')') {
+            return false;
+        }
+    }
+
+    (7..=15).contains(&digits)
+}
+
+fn phone_url(value: &str) -> Option<String> {
+    if !is_phone_number(value) {
+        return None;
+    }
+
+    let mut phone = String::new();
+    for ch in value.trim().chars() {
+        if ch.is_ascii_digit() || (ch == '+' && phone.is_empty()) {
+            phone.push(ch);
+        }
+    }
+    Some(format!("tel:{phone}"))
+}
+
+fn mask_sensitive_text(text: &str) -> String {
+    mask_api_tokens(&mask_credit_card_numbers(text))
+}
+
+fn mask_credit_card_numbers(text: &str) -> String {
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let mut result = String::new();
+    let mut last = 0;
+    let mut index = 0;
+
+    while index < chars.len() {
+        let (start, ch) = chars[index];
+        if !ch.is_ascii_digit() {
+            index += 1;
+            continue;
+        }
+
+        let mut scan = index;
+        let mut end = start + ch.len_utf8();
+        let mut digits = String::new();
+        while scan < chars.len() {
+            let (byte_index, scan_ch) = chars[scan];
+            if scan_ch.is_ascii_digit() {
+                digits.push(scan_ch);
+                end = byte_index + scan_ch.len_utf8();
+                scan += 1;
+            } else if matches!(scan_ch, ' ' | '-')
+                && !digits.is_empty()
+                && chars
+                    .get(scan + 1)
+                    .is_some_and(|(_, next)| next.is_ascii_digit())
+            {
+                end = byte_index + scan_ch.len_utf8();
+                scan += 1;
+            } else {
+                break;
+            }
+
+            if digits.len() > 19 {
+                break;
+            }
+        }
+
+        if (13..=19).contains(&digits.len()) && luhn_valid(&digits) {
+            result.push_str(&text[last..start]);
+            result.push_str(&mask_card_number(&digits));
+            last = end;
+            index = scan;
+        } else {
+            index += 1;
+        }
+    }
+
+    result.push_str(&text[last..]);
+    result
+}
+
+fn contains_luhn_card_number(text: &str) -> bool {
+    mask_credit_card_numbers(text) != text
+}
+
+fn luhn_valid(digits: &str) -> bool {
+    let mut chars = digits.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if chars.all(|ch| ch == first) {
+        return false;
+    }
+
+    let mut sum = 0;
+    let mut double = false;
+    for ch in digits.chars().rev() {
+        let Some(mut digit) = ch.to_digit(10) else {
+            return false;
+        };
+        if double {
+            digit *= 2;
+            if digit > 9 {
+                digit -= 9;
+            }
+        }
+        sum += digit;
+        double = !double;
+    }
+
+    sum % 10 == 0
+}
+
+fn mask_card_number(digits: &str) -> String {
+    let last_four = last_chars(digits, 4);
+    format!("•••• •••• •••• {last_four}")
+}
+
+fn mask_api_tokens(text: &str) -> String {
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let mut result = String::new();
+    let mut last = 0;
+    let mut index = 0;
+
+    while index < chars.len() {
+        let (start, ch) = chars[index];
+        if !is_secret_token_char(ch) {
+            index += 1;
+            continue;
+        }
+
+        let mut scan = index;
+        let mut end = start + ch.len_utf8();
+        while scan < chars.len() {
+            let (byte_index, scan_ch) = chars[scan];
+            if is_secret_token_char(scan_ch) {
+                end = byte_index + scan_ch.len_utf8();
+                scan += 1;
+            } else {
+                break;
+            }
+        }
+
+        let token = &text[start..end];
+        if let Some(masked) = mask_api_token(token, sensitive_context_before(text, start)) {
+            result.push_str(&text[last..start]);
+            result.push_str(&masked);
+            last = end;
+        }
+        index = scan;
+    }
+
+    result.push_str(&text[last..]);
+    result
+}
+
+fn is_secret_token_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_')
+}
+
+fn mask_api_token(token: &str, sensitive_context: bool) -> Option<String> {
+    const PREFIXES: &[&str] = &[
+        "sk-proj-",
+        "sk-",
+        "ghp_",
+        "github_pat_",
+        "AKIA",
+        "xoxb-",
+        "xoxp-",
+        "AIza",
+    ];
+
+    if let Some(prefix) = PREFIXES
+        .iter()
+        .copied()
+        .find(|prefix| token.starts_with(prefix) && token.len() >= prefix.len() + 8)
+    {
+        return Some(format!("{prefix}...{}", last_chars(token, 4)));
+    }
+
+    if sensitive_context && looks_like_secret_value(token) {
+        return Some(format!("••••{}", last_chars(token, 4)));
+    }
+
+    None
+}
+
+fn sensitive_context_before(text: &str, start: usize) -> bool {
+    let context: String = text[..start]
+        .chars()
+        .rev()
+        .take(48)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>()
+        .to_ascii_lowercase();
+
+    [
+        "api_key",
+        "apikey",
+        "access_key",
+        "secret",
+        "token",
+        "password",
+        "passwd",
+        "credential",
+    ]
+    .iter()
+    .any(|label| context.contains(label))
+}
+
+fn looks_like_secret_value(token: &str) -> bool {
+    if token.len() < 32 {
+        return false;
+    }
+
+    let has_alpha = token.chars().any(|ch| ch.is_ascii_alphabetic());
+    let has_digit = token.chars().any(|ch| ch.is_ascii_digit());
+    has_alpha && has_digit
+}
+
+fn last_chars(value: &str, count: usize) -> String {
+    let mut chars = value.chars().rev().take(count).collect::<Vec<_>>();
+    chars.reverse();
+    chars.into_iter().collect()
+}
+
 fn summarize_text(text: &str) -> String {
     const LIMIT: usize = 180;
     let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -1770,6 +2294,38 @@ mod tests {
         assert_eq!(store.items[1].text.as_deref(), Some("first copied item"));
 
         let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn classifies_common_text_payloads() {
+        assert_eq!(classify_text("https://example.com"), ClipKind::Url);
+        assert_eq!(classify_text("person@example.com"), ClipKind::Email);
+        assert_eq!(classify_text("+44 20 7946 0958"), ClipKind::Phone);
+    }
+
+    #[test]
+    fn classifies_existing_file_paths() {
+        let path = std::env::temp_dir().join(format!("better-clipboard-file-{}", Uuid::new_v4()));
+        fs::write(&path, "test").expect("write temp file");
+
+        assert_eq!(
+            classify_text(path.to_str().expect("utf-8 temp path")),
+            ClipKind::FilePath
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn masks_sensitive_display_values_without_changing_raw_text() {
+        let raw = "card 4111 1111 1111 1111 and key sk-proj-abcdefghijklmnopqrstuvwxyz123456";
+        let item = ClipItem::from_text(raw.to_owned(), "hash".to_owned());
+
+        assert_eq!(item.text.as_deref(), Some(raw));
+        assert!(item.summary.contains("•••• •••• •••• 1111"));
+        assert!(item.summary.contains("sk-proj-...3456"));
+        assert!(!item.summary.contains("4111 1111 1111 1111"));
+        assert!(!item.summary.contains("abcdefghijklmnopqrstuvwxyz"));
     }
 
     fn text_snapshot(text: &str) -> ClipboardSnapshot {
