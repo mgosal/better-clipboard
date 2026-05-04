@@ -1,12 +1,11 @@
 # Manual Test Script
 
-Use this script for release testing before filing issues. The current release candidate is acceptable for the core keyboard workflow even though layout polish and Share are still known issues.
+Use this script for release testing before filing issues. The current release candidate should cover the core keyboard workflow, native Share, file-list capture, and the compact-to-expanded scroll behavior.
 
 ## Current Known Issues
 
-- Row layout needs polish around spacing, visual hierarchy, and action buttons.
-- The Share button and `S` shortcut are not reliable yet.
-- Use `C` as the current fallback for copying an item to the clipboard without pasting.
+- Native Share targets vary by macOS version and installed apps, so record item type and destination for Share failures.
+- If automatic paste fails, the selected item should still remain on the clipboard for manual `Cmd+V`.
 
 ## Setup
 
@@ -21,14 +20,16 @@ Use this script for release testing before filing issues. The current release ca
 - [ ] Copy plain text from any app.
 - [ ] Copy a URL.
 - [ ] Copy an existing local file path.
+- [ ] Copy one or more files in Finder.
 - [ ] Copy an email address.
 - [ ] Copy a phone number.
 - [ ] Copy an image.
 - [ ] Open Better Clipboard with `Option+Space`.
 - [ ] Confirm all copied items appear in newest-first order.
-- [ ] Confirm text, URL, file, email, and phone rows are left-aligned.
+- [ ] Confirm text, URL, file path, file-list, email, and phone rows are left-aligned.
 - [ ] Confirm each row shows an action button.
 - [ ] Confirm clickable action buttons appear in the bottom-right of each row, with keyboard shortcuts underneath the icons.
+- [ ] Confirm metadata appears bottom-left on the same bottom row as the action buttons.
 - [ ] Confirm image row tiles fill the row height.
 - [ ] Note any row spacing, clipping, alignment, or hierarchy issues for a GitHub layout issue.
 - [ ] Copy a test credit card number such as `4111 1111 1111 1111`.
@@ -41,6 +42,8 @@ Use this script for release testing before filing issues. The current release ca
 - [ ] Confirm the selected row stays visible as the list scrolls.
 - [ ] Press `Up` repeatedly.
 - [ ] Confirm the selected row stays visible while moving upward.
+- [ ] Reopen in compact mode, scroll the mouse wheel once, and confirm the palette expands past 3 items without snapping back to the selected row.
+- [ ] Continue mouse scrolling and confirm the scroll position stays under mouse control.
 - [ ] Select a URL item and press `O`.
 - [ ] Confirm the URL opens in the default browser.
 - [ ] Select a text item and press `C`.
@@ -49,12 +52,17 @@ Use this script for release testing before filing issues. The current release ca
 - [ ] Confirm the file opens.
 - [ ] Select a file path item and press `F`.
 - [ ] Confirm Finder reveals the file.
+- [ ] Select a Finder file-list item and press `O`.
+- [ ] Confirm the copied files open without Better Clipboard creating duplicate files.
+- [ ] Select a Finder file-list item and press `F`.
+- [ ] Confirm Finder reveals the first file.
 - [ ] Select an email item and press `O`.
 - [ ] Confirm the default mail app opens a composer.
 - [ ] Select a phone item and press `O`.
 - [ ] Confirm macOS opens the configured phone handler.
 - [ ] Select any item and press `S`.
-- [ ] Known issue check: record whether Share copies the item, closes the palette, shifts focus, or does nothing.
+- [ ] Confirm the native macOS share sheet opens above Better Clipboard.
+- [ ] Dismiss the share sheet and confirm Better Clipboard remains open.
 - [ ] Click the bottom-right `Paste` / `Enter` action on an item.
 - [ ] Confirm the item pastes into the original app.
 - [ ] Press `Cmd+Down` or `Tab` to expand the list.
@@ -91,12 +99,13 @@ Use this script for release testing before filing issues. The current release ca
 - [ ] Reopen Better Clipboard and click the bottom-right `Copy` / `C` button on a non-newest text item.
 - [ ] Confirm the palette closes and the item is copied without moving to the top of history.
 - [ ] Reopen Better Clipboard and click the bottom-right `Share` / `S` button.
-- [ ] Known issue check: record what happens. Do not block core workflow sign-off only on Share.
+- [ ] Confirm the native macOS share sheet opens above Better Clipboard and the palette remains open after the sheet is dismissed.
 
 ## Known Issue Filing
 
 - [ ] File one GitHub issue for row layout problems, with screenshots and notes about window size, selected item type, and whether compact or expanded mode was used.
-- [ ] File one GitHub issue for Share behavior, with the exact item type, whether mouse or `S` was used, and what happened to focus and clipboard contents.
+- [ ] File one GitHub issue for Share behavior, with the exact item type, whether mouse or `S` was used, the destination app, and what happened to focus and clipboard contents.
+- [ ] File one GitHub issue for file-list behavior if copied Finder files do not appear, open, reveal, share, or paste as expected.
 - [ ] File separate issues for paste-focus problems, image-preview problems, install/startup problems, or permission problems.
 - [ ] Use the manual test report template if reporting a full pass/fail run.
 
@@ -105,10 +114,10 @@ Use this script for release testing before filing issues. The current release ca
 - [ ] Select an image item.
 - [ ] Press `Right Arrow`.
 - [ ] Confirm an image-only floating preview opens centered at about 50% display size.
-- [ ] Press `Right Arrow` again and confirm the preview grows to 100% display size.
-- [ ] Press `Left Arrow` and confirm the preview returns to 50%.
-- [ ] Press `Escape` and confirm only the preview closes.
-- [ ] Open the preview again and press `Enter`.
+- [ ] Press `Right Arrow` again and confirm the preview remains a single fixed preview rather than zooming.
+- [ ] Press `Left Arrow` and confirm the preview closes.
+- [ ] Open the preview again, press `Escape`, and confirm only the preview closes.
+- [ ] Open the preview again, then press `Enter`.
 - [ ] Confirm the preview and palette close, then the image is pasted into the original app.
 
 ## Settings

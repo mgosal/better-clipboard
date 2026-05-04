@@ -31,7 +31,16 @@ use global_hotkey::{
     hotkey::{Code, HotKey, Modifiers},
 };
 use image::{ImageBuffer, ImageReader, Rgba};
-use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication, NSWorkspace};
+use objc2::{
+    AnyThread, MainThreadMarker, Message,
+    rc::Retained,
+    runtime::{AnyObject, ProtocolObject},
+};
+use objc2_app_kit::{
+    NSApplication, NSApplicationActivationOptions, NSPasteboard, NSPasteboardTypeFileURL,
+    NSPasteboardWriting, NSRunningApplication, NSSharingServicePicker, NSWorkspace,
+};
+use objc2_foundation::{NSArray, NSPoint, NSRect, NSRectEdge, NSSize, NSString, NSURL};
 use serde::{Deserialize, Serialize};
 use tray_icon::{
     TrayIcon, TrayIconBuilder,
@@ -46,8 +55,7 @@ const MAX_HISTORY_LIMIT: usize = 1_000;
 const COMPACT_VISIBLE_ITEMS: usize = 3;
 const ROW_HEIGHT: f32 = 118.0;
 const THUMBNAIL_SIZE: f32 = 74.0;
-const TEXT_PREVIEW_HEIGHT: f32 = 44.0;
-const METADATA_HEIGHT: f32 = 18.0;
+const TEXT_PREVIEW_HEIGHT: f32 = 62.0;
 const PREVIEW_SCALE: f32 = 0.5;
 const PREVIEW_MAX_IMAGE_WIDTH: f32 = 1_280.0;
 const PREVIEW_MAX_IMAGE_HEIGHT: f32 = 900.0;
@@ -266,12 +274,23 @@ impl ClipboardMonitor {
 }
 
 fn clipboard_change_count() -> i64 {
-    use objc2_app_kit::NSPasteboard;
-
     NSPasteboard::generalPasteboard().changeCount() as i64
 }
 
 fn read_clipboard(clipboard: &mut Clipboard) -> Option<ClipboardSnapshot> {
+    if let Some(paths) = read_file_paths_from_pasteboard() {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"files:");
+        for path in &paths {
+            hasher.update(path.to_string_lossy().as_bytes());
+            hasher.update(b"\0");
+        }
+        return Some(ClipboardSnapshot::Files {
+            paths,
+            hash: hasher.finalize().to_hex().to_string(),
+        });
+    }
+
     if let Ok(text) = clipboard.get_text() {
         let text = text.trim_end_matches('\0').to_owned();
         if !text.trim().is_empty() {
@@ -302,9 +321,48 @@ fn read_clipboard(clipboard: &mut Clipboard) -> Option<ClipboardSnapshot> {
     None
 }
 
+fn read_file_paths_from_pasteboard() -> Option<Vec<PathBuf>> {
+    let pasteboard = NSPasteboard::generalPasteboard();
+    let mut paths = Vec::new();
+
+    if let Some(items) = pasteboard.pasteboardItems() {
+        for item in items.iter() {
+            if let Some(value) = item.stringForType(unsafe { NSPasteboardTypeFileURL }) {
+                if let Some(path) = file_path_from_file_url_string(&value.to_string()) {
+                    paths.push(path);
+                }
+            }
+        }
+    }
+
+    if paths.is_empty() {
+        if let Some(value) = pasteboard.stringForType(unsafe { NSPasteboardTypeFileURL }) {
+            if let Some(path) = file_path_from_file_url_string(&value.to_string()) {
+                paths.push(path);
+            }
+        }
+    }
+
+    paths.dedup();
+    (!paths.is_empty()).then_some(paths)
+}
+
+fn file_path_from_file_url_string(value: &str) -> Option<PathBuf> {
+    let url = Url::parse(value.trim()).ok()?;
+    if url.scheme() != "file" {
+        return None;
+    }
+    let path = url.to_file_path().ok()?;
+    path.exists().then_some(path)
+}
+
 enum ClipboardSnapshot {
     Text {
         text: String,
+        hash: String,
+    },
+    Files {
+        paths: Vec<PathBuf>,
         hash: String,
     },
     Image {
@@ -318,7 +376,7 @@ enum ClipboardSnapshot {
 impl ClipboardSnapshot {
     fn hash(&self) -> &str {
         match self {
-            Self::Text { hash, .. } | Self::Image { hash, .. } => hash,
+            Self::Text { hash, .. } | Self::Files { hash, .. } | Self::Image { hash, .. } => hash,
         }
     }
 }
@@ -465,6 +523,7 @@ impl HistoryStore {
         self.items.retain(|item| item.hash != hash);
         let item = match snapshot {
             ClipboardSnapshot::Text { text, hash } => ClipItem::from_text(text, hash),
+            ClipboardSnapshot::Files { paths, hash } => ClipItem::from_files(paths, hash),
             ClipboardSnapshot::Image {
                 width,
                 height,
@@ -562,6 +621,7 @@ impl HistoryStore {
                 width,
                 height,
             }),
+            files: Vec::new(),
             created_at: Local::now(),
             hash,
         })
@@ -575,6 +635,8 @@ struct ClipItem {
     summary: String,
     text: Option<String>,
     image: Option<ImageClip>,
+    #[serde(default)]
+    files: Vec<PathBuf>,
     created_at: DateTime<Local>,
     hash: String,
 }
@@ -589,6 +651,20 @@ impl ClipItem {
             summary: summary_for_text(&text),
             text: Some(text),
             image: None,
+            files: Vec::new(),
+            created_at: Local::now(),
+            hash,
+        }
+    }
+
+    fn from_files(paths: Vec<PathBuf>, hash: String) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            kind: ClipKind::Files,
+            summary: summary_for_files(&paths),
+            text: None,
+            image: None,
+            files: paths,
             created_at: Local::now(),
             hash,
         }
@@ -603,6 +679,7 @@ enum ClipKind {
     Email,
     Phone,
     Image,
+    Files,
 }
 
 impl ClipKind {
@@ -614,6 +691,7 @@ impl ClipKind {
             Self::Email => "Email",
             Self::Phone => "Phone",
             Self::Image => "Image",
+            Self::Files => "Files",
         }
     }
 }
@@ -643,31 +721,17 @@ struct BetterClipboardApp {
     select_first_on_show: bool,
     palette_expanded: bool,
     preview_item: Option<ImagePreviewState>,
+    share_picker: Option<Retained<NSSharingServicePicker>>,
     previous_frontmost_pid: Option<i32>,
     shown_at: Instant,
     focus_loss_started: Option<Instant>,
+    scroll_selected_into_view: bool,
     last_repaint: Instant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ImagePreviewState {
     item_id: Uuid,
-    scale: ImagePreviewScale,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ImagePreviewScale {
-    Half,
-    Full,
-}
-
-impl ImagePreviewScale {
-    fn factor(self) -> f32 {
-        match self {
-            Self::Half => PREVIEW_SCALE,
-            Self::Full => 1.0,
-        }
-    }
 }
 
 impl BetterClipboardApp {
@@ -711,9 +775,11 @@ impl BetterClipboardApp {
             select_first_on_show: true,
             palette_expanded: false,
             preview_item: None,
+            share_picker: None,
             previous_frontmost_pid: None,
             shown_at: Instant::now(),
             focus_loss_started: None,
+            scroll_selected_into_view: false,
             last_repaint: Instant::now(),
         }
     }
@@ -753,6 +819,7 @@ impl BetterClipboardApp {
         self.settings_open = false;
         self.permission_onboarding = false;
         self.close_image_preview(ctx);
+        self.scroll_selected_into_view = true;
         self.shown_at = Instant::now();
         self.focus_loss_started = None;
         self.resize_palette(ctx);
@@ -786,6 +853,7 @@ impl BetterClipboardApp {
         self.permission_onboarding = false;
         self.focus_loss_started = None;
         self.close_image_preview(ctx);
+        self.close_share_picker();
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
     }
 
@@ -930,6 +998,7 @@ impl BetterClipboardApp {
         if self.select_first_on_show || !selected_is_visible {
             self.selected = Some(visible_items[0].id);
             self.select_first_on_show = false;
+            self.scroll_selected_into_view = true;
         }
     }
 
@@ -948,6 +1017,7 @@ impl BetterClipboardApp {
         let max = visible_items.len() as isize - 1;
         let next = (current as isize + delta).clamp(0, max) as usize;
         self.selected = Some(visible_items[next].id);
+        self.scroll_selected_into_view = true;
     }
 
     fn close_image_preview(&mut self, ctx: &egui::Context) {
@@ -958,29 +1028,14 @@ impl BetterClipboardApp {
 
     fn open_image_preview(&mut self, item: &ClipItem, ctx: &egui::Context) {
         if item.kind == ClipKind::Image {
-            self.preview_item = Some(ImagePreviewState {
-                item_id: item.id,
-                scale: ImagePreviewScale::Half,
-            });
+            self.preview_item = Some(ImagePreviewState { item_id: item.id });
             ctx.request_repaint();
         }
     }
 
-    fn zoom_image_preview_in(&mut self, ctx: &egui::Context) {
-        if let Some(preview) = &mut self.preview_item {
-            preview.scale = ImagePreviewScale::Full;
-            ctx.request_repaint();
-        }
-    }
-
-    fn step_image_preview_back(&mut self, ctx: &egui::Context) {
-        match self.preview_item.as_mut() {
-            Some(preview) if preview.scale == ImagePreviewScale::Full => {
-                preview.scale = ImagePreviewScale::Half;
-                ctx.request_repaint();
-            }
-            Some(_) => self.close_image_preview(ctx),
-            None => {}
+    fn close_share_picker(&mut self) {
+        if let Some(picker) = self.share_picker.take() {
+            picker.close();
         }
     }
 
@@ -993,6 +1048,9 @@ impl BetterClipboardApp {
                 self.open_url(item, ctx);
             }
             ClipKind::FilePath => {
+                self.reveal_file_in_finder(item, ctx);
+            }
+            ClipKind::Files => {
                 self.reveal_file_in_finder(item, ctx);
             }
             ClipKind::Email => {
@@ -1014,6 +1072,7 @@ impl BetterClipboardApp {
             }
             ClipKind::Url => self.open_url(item, ctx),
             ClipKind::FilePath => self.open_file_path(item, ctx),
+            ClipKind::Files => self.open_file_path(item, ctx),
             ClipKind::Email => self.open_email(item, ctx),
             ClipKind::Phone => self.open_phone(item, ctx),
             ClipKind::Image => self.open_image_preview(item, ctx),
@@ -1035,15 +1094,22 @@ impl BetterClipboardApp {
     }
 
     fn open_file_path(&mut self, item: &ClipItem, ctx: &egui::Context) {
-        let Some(path) = item.text.as_deref().and_then(file_path_from_text) else {
+        let paths = file_paths_for_item(item);
+        if paths.is_empty() {
             self.status = "Open file failed: file path is unavailable".to_owned();
             return;
-        };
-        self.open_path_with_macos(path, "Opened file", "Open file failed", Some(item.id), ctx);
+        }
+        self.open_paths_with_macos(
+            &paths,
+            "Opened file",
+            "Open file failed",
+            Some(item.id),
+            ctx,
+        );
     }
 
     fn reveal_file_in_finder(&mut self, item: &ClipItem, ctx: &egui::Context) {
-        let Some(path) = item.text.as_deref().and_then(file_path_from_text) else {
+        let Some(path) = file_paths_for_item(item).into_iter().next() else {
             self.status = "Reveal failed: file path is unavailable".to_owned();
             return;
         };
@@ -1111,12 +1177,7 @@ impl BetterClipboardApp {
             RowAction::Open => self.open_item(item, data_dir, ctx),
             RowAction::Reveal => self.reveal_file_in_finder(item, ctx),
             RowAction::Preview => self.open_image_preview(item, ctx),
-            RowAction::Share => self.copy_item_and_hide(
-                item,
-                data_dir,
-                ctx,
-                &format!("Copied {} for sharing", item.kind.label().to_lowercase()),
-            ),
+            RowAction::Share => self.share_item(item, data_dir),
         }
     }
 
@@ -1140,15 +1201,15 @@ impl BetterClipboardApp {
         }
     }
 
-    fn open_path_with_macos(
+    fn open_paths_with_macos(
         &mut self,
-        path: PathBuf,
+        paths: &[PathBuf],
         success: &str,
         failure: &str,
         selected: Option<Uuid>,
         ctx: &egui::Context,
     ) {
-        match Command::new("open").arg(path).spawn() {
+        match Command::new("open").args(paths).spawn() {
             Ok(_) => {
                 self.status = success.to_owned();
                 self.selected = selected;
@@ -1156,6 +1217,20 @@ impl BetterClipboardApp {
             }
             Err(err) => {
                 self.status = format!("{failure}: {err}");
+            }
+        }
+    }
+
+    fn share_item(&mut self, item: &ClipItem, data_dir: &Path) {
+        match open_share_sheet(item, data_dir) {
+            Ok(picker) => {
+                self.share_picker = Some(picker);
+                self.status = format!("Sharing {}", item.kind.label().to_lowercase());
+                self.selected = Some(item.id);
+                self.focus_loss_started = None;
+            }
+            Err(err) => {
+                self.status = format!("Share failed: {err:#}");
             }
         }
     }
@@ -1207,11 +1282,10 @@ impl BetterClipboardApp {
 
         if self.preview_item.is_some() {
             if right {
-                self.zoom_image_preview_in(ctx);
                 return;
             }
             if left || escape {
-                self.step_image_preview_back(ctx);
+                self.close_image_preview(ctx);
                 return;
             }
             if enter {
@@ -1233,12 +1307,8 @@ impl BetterClipboardApp {
             if share {
                 if let Some(index) = self.selected_index(visible_items) {
                     let item = &visible_items[index];
-                    self.copy_item_and_hide(
-                        item,
-                        data_dir,
-                        ctx,
-                        &format!("Copied {} for sharing", item.kind.label().to_lowercase()),
-                    );
+                    self.close_image_preview(ctx);
+                    self.share_item(item, data_dir);
                 }
             }
             return;
@@ -1294,26 +1364,41 @@ impl BetterClipboardApp {
         }
         if finder {
             if let Some(index) = self.selected_index(visible_items) {
-                if visible_items[index].kind == ClipKind::FilePath {
+                if matches!(
+                    visible_items[index].kind,
+                    ClipKind::FilePath | ClipKind::Files
+                ) {
                     self.reveal_file_in_finder(&visible_items[index], ctx);
                 }
             }
         }
         if share {
             if let Some(index) = self.selected_index(visible_items) {
-                let item = &visible_items[index];
-                self.copy_item_and_hide(
-                    item,
-                    data_dir,
-                    ctx,
-                    &format!("Copied {} for sharing", item.kind.label().to_lowercase()),
-                );
+                self.share_item(&visible_items[index], data_dir);
             }
         }
         if enter {
             if let Some(index) = self.selected_index(visible_items) {
                 self.copy_and_paste_item(&visible_items[index], data_dir, ctx);
             }
+        }
+    }
+
+    fn handle_scroll_intent(&mut self, ctx: &egui::Context, item_count: usize) {
+        if !self.window_visible || self.settings_open || self.permission_onboarding {
+            return;
+        }
+
+        let scrolled = ctx.input(|input| {
+            input.raw_scroll_delta.y.abs() > 0.0 || input.smooth_scroll_delta.y.abs() > 0.0
+        });
+        if !scrolled {
+            return;
+        }
+
+        self.scroll_selected_into_view = false;
+        if item_count > COMPACT_VISIBLE_ITEMS && !self.palette_expanded {
+            self.set_expanded(true, ctx);
         }
     }
 
@@ -1488,6 +1573,7 @@ impl eframe::App for BetterClipboardApp {
         let visible_items = items.clone();
         self.ensure_selection(&visible_items);
         self.handle_keyboard(ctx, &visible_items, &data_dir);
+        self.handle_scroll_intent(ctx, visible_items.len());
         let display_items: Vec<ClipItem> = if self.settings_open {
             Vec::new()
         } else if self.palette_expanded {
@@ -1556,6 +1642,7 @@ impl eframe::App for BetterClipboardApp {
                     return;
                 }
 
+                let mut did_scroll_selected = false;
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     for item in display_items {
                         let selected = self.selected == Some(item.id);
@@ -1610,27 +1697,38 @@ impl eframe::App for BetterClipboardApp {
                                             .wrap()
                                             .halign(egui::Align::Min),
                                         );
-                                        ui.add_sized(
-                                            egui::vec2(content_width, METADATA_HEIGHT),
-                                            egui::Label::new(
-                                                RichText::new(format!(
-                                                    "{} · {}",
-                                                    item.kind.label(),
-                                                    item.created_at.format("%H:%M:%S")
-                                                ))
-                                                .color(muted),
-                                            )
-                                            .truncate()
-                                            .halign(egui::Align::Min),
-                                        );
                                         ui.allocate_ui_with_layout(
                                             egui::vec2(content_width, HINT_CHIP_HEIGHT),
-                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            egui::Layout::left_to_right(egui::Align::Center),
                                             |ui| {
-                                                row_action = show_row_action_buttons(
-                                                    ui,
-                                                    item.kind,
-                                                    self.settings.theme,
+                                                let actions_width =
+                                                    row_action_buttons_width(item.kind);
+                                                let metadata_width =
+                                                    (content_width - actions_width - 10.0).max(0.0);
+                                                ui.add_sized(
+                                                    egui::vec2(metadata_width, HINT_CHIP_HEIGHT),
+                                                    egui::Label::new(
+                                                        RichText::new(format!(
+                                                            "{} · {}",
+                                                            item.kind.label(),
+                                                            item.created_at.format("%H:%M:%S")
+                                                        ))
+                                                        .color(muted),
+                                                    )
+                                                    .truncate()
+                                                    .halign(egui::Align::Min),
+                                                );
+                                                ui.with_layout(
+                                                    egui::Layout::right_to_left(
+                                                        egui::Align::Center,
+                                                    ),
+                                                    |ui| {
+                                                        row_action = show_row_action_buttons(
+                                                            ui,
+                                                            item.kind,
+                                                            self.settings.theme,
+                                                        );
+                                                    },
                                                 );
                                             },
                                         );
@@ -1653,12 +1751,16 @@ impl eframe::App for BetterClipboardApp {
                             }
                         }
 
-                        if selected {
+                        if selected && self.scroll_selected_into_view {
                             response.scroll_to_me(Some(egui::Align::Center));
+                            did_scroll_selected = true;
                         }
                         ui.add_space(6.0);
                     }
                 });
+                if did_scroll_selected {
+                    self.scroll_selected_into_view = false;
+                }
             });
 
         self.show_image_preview(ctx, &data_dir, &visible_items);
@@ -1670,8 +1772,6 @@ impl eframe::App for BetterClipboardApp {
 enum PreviewAction {
     None,
     Close,
-    Back,
-    ZoomIn,
     Paste,
 }
 
@@ -1693,7 +1793,7 @@ impl BetterClipboardApp {
             return;
         };
 
-        let image_size = preview_image_size(ctx, image.width, image.height, preview.scale);
+        let image_size = preview_image_size(ctx, image.width, image.height);
         let window_size = image_size;
 
         if !self.textures.contains_key(&item.id) {
@@ -1717,13 +1817,10 @@ impl BetterClipboardApp {
                 return PreviewAction::Close;
             }
             if ctx.input(|input| input.key_pressed(Key::Escape)) {
-                return PreviewAction::Back;
+                return PreviewAction::Close;
             }
             if ctx.input(|input| input.key_pressed(Key::ArrowLeft)) {
-                return PreviewAction::Back;
-            }
-            if ctx.input(|input| input.key_pressed(Key::ArrowRight)) {
-                return PreviewAction::ZoomIn;
+                return PreviewAction::Close;
             }
             if ctx.input(|input| input.key_pressed(Key::Enter)) {
                 return PreviewAction::Paste;
@@ -1753,8 +1850,6 @@ impl BetterClipboardApp {
         match action {
             PreviewAction::None => {}
             PreviewAction::Close => self.close_image_preview(ctx),
-            PreviewAction::Back => self.step_image_preview_back(ctx),
-            PreviewAction::ZoomIn => self.zoom_image_preview_in(ctx),
             PreviewAction::Paste => self.copy_and_paste_item(&item, data_dir, ctx),
         }
     }
@@ -1801,17 +1896,12 @@ fn image_preview_position(ctx: &egui::Context, size: egui::Vec2) -> Option<egui:
     })
 }
 
-fn preview_image_size(
-    ctx: &egui::Context,
-    width: usize,
-    height: usize,
-    scale: ImagePreviewScale,
-) -> egui::Vec2 {
+fn preview_image_size(ctx: &egui::Context, width: usize, height: usize) -> egui::Vec2 {
     let width = width.max(1) as f32;
     let height = height.max(1) as f32;
     let pixels_per_point = ctx.pixels_per_point().max(1.0);
     let native_size = egui::vec2(width / pixels_per_point, height / pixels_per_point);
-    let scaled = native_size * scale.factor();
+    let scaled = native_size * PREVIEW_SCALE;
     let cap_scale = (PREVIEW_MAX_IMAGE_WIDTH / scaled.x)
         .min(PREVIEW_MAX_IMAGE_HEIGHT / scaled.y)
         .min(1.0);
@@ -1889,7 +1979,7 @@ fn show_row_action_buttons(
         ActionIcon::Share,
         "Share",
         "S",
-        "Share: copy this item ready to share",
+        "Open macOS share sheet",
         theme,
     )
     .clicked()
@@ -1938,6 +2028,25 @@ fn show_row_action_buttons(
                 action = Some(RowAction::Open);
             }
         }
+        ClipKind::Files => {
+            if show_row_action_button(
+                ui,
+                ActionIcon::Finder,
+                "Finder",
+                "F",
+                "Reveal in Finder",
+                theme,
+            )
+            .clicked()
+            {
+                action = Some(RowAction::Reveal);
+            }
+            if show_row_action_button(ui, ActionIcon::Open, "Open", "O", "Open files", theme)
+                .clicked()
+            {
+                action = Some(RowAction::Open);
+            }
+        }
         ClipKind::Email => {
             if show_row_action_button(ui, ActionIcon::Email, "Email", "O", "Compose email", theme)
                 .clicked()
@@ -1965,7 +2074,7 @@ fn show_row_action_buttons(
                 ActionIcon::Preview,
                 "Preview",
                 "Right",
-                "Preview image; press again for 100%",
+                "Preview image",
                 theme,
             )
             .clicked()
@@ -1989,6 +2098,21 @@ fn show_row_action_buttons(
     }
 
     action
+}
+
+fn row_action_buttons_width(kind: ClipKind) -> f32 {
+    let count = row_action_button_count(kind) as f32;
+    (count * HINT_CHIP_WIDTH) + ((count - 1.0).max(0.0) * HINT_CHIP_GAP)
+}
+
+fn row_action_button_count(kind: ClipKind) -> usize {
+    let paste = 1;
+    let share = 1;
+    let type_specific = match kind {
+        ClipKind::Text | ClipKind::Url | ClipKind::Email | ClipKind::Phone | ClipKind::Image => 1,
+        ClipKind::FilePath | ClipKind::Files => 2,
+    };
+    paste + share + type_specific
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2312,6 +2436,7 @@ fn show_item_action_button(
         ClipKind::Email => ActionIcon::Email,
         ClipKind::Phone => ActionIcon::Phone,
         ClipKind::Image => ActionIcon::Preview,
+        ClipKind::Files => ActionIcon::Finder,
     };
     let hover_text = match item.kind {
         ClipKind::Text => "Copy text to clipboard",
@@ -2320,6 +2445,7 @@ fn show_item_action_button(
         ClipKind::Email => "Compose email",
         ClipKind::Phone => "Open phone handler",
         ClipKind::Image => "Preview image",
+        ClipKind::Files => "Reveal in Finder",
     };
     draw_action_icon(
         ui.painter(),
@@ -2369,15 +2495,16 @@ fn load_color_image(path: &Path) -> Result<egui::ColorImage> {
 }
 
 fn copy_item_to_clipboard(item: &ClipItem, data_dir: &Path) -> Result<()> {
-    let mut clipboard = Clipboard::new().context("open clipboard")?;
     match item.kind {
         ClipKind::Text | ClipKind::Url | ClipKind::FilePath | ClipKind::Email | ClipKind::Phone => {
+            let mut clipboard = Clipboard::new().context("open clipboard")?;
             let text = item.text.as_deref().context("missing text payload")?;
             clipboard
                 .set_text(text.to_owned())
                 .context("set clipboard text")?;
         }
         ClipKind::Image => {
+            let mut clipboard = Clipboard::new().context("open clipboard")?;
             let image = item.image.as_ref().context("missing image payload")?;
             let rgba = ImageReader::open(data_dir.join(&image.path))
                 .context("open stored image")?
@@ -2392,8 +2519,117 @@ fn copy_item_to_clipboard(item: &ClipItem, data_dir: &Path) -> Result<()> {
                 })
                 .context("set clipboard image")?;
         }
+        ClipKind::Files => {
+            write_file_urls_to_clipboard(&item.files)?;
+        }
     }
     Ok(())
+}
+
+fn write_file_urls_to_clipboard(paths: &[PathBuf]) -> Result<()> {
+    let objects = file_pasteboard_objects(paths)?;
+    let pasteboard = NSPasteboard::generalPasteboard();
+    pasteboard.clearContents();
+    if pasteboard.writeObjects(&objects) {
+        Ok(())
+    } else {
+        anyhow::bail!("NSPasteboard refused file URLs")
+    }
+}
+
+fn file_pasteboard_objects(
+    paths: &[PathBuf],
+) -> Result<Retained<NSArray<ProtocolObject<dyn NSPasteboardWriting>>>> {
+    let urls = paths
+        .iter()
+        .filter_map(|path| {
+            let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+            NSURL::from_file_path(canonical).map(ProtocolObject::from_retained)
+        })
+        .collect::<Vec<Retained<ProtocolObject<dyn NSPasteboardWriting>>>>();
+
+    if urls.is_empty() {
+        anyhow::bail!("missing file payload")
+    }
+
+    Ok(NSArray::from_retained_slice(&urls))
+}
+
+fn open_share_sheet(item: &ClipItem, data_dir: &Path) -> Result<Retained<NSSharingServicePicker>> {
+    let share_items = share_items_for_clip(item, data_dir)?;
+    if share_items.is_empty() {
+        anyhow::bail!("missing share payload");
+    }
+
+    let items = NSArray::from_retained_slice(&share_items);
+    let picker =
+        unsafe { NSSharingServicePicker::initWithItems(NSSharingServicePicker::alloc(), &items) };
+    let mtm = MainThreadMarker::new().context("share sheet must run on the main thread")?;
+    let app = NSApplication::sharedApplication(mtm);
+    let window = app
+        .keyWindow()
+        .or_else(|| app.mainWindow())
+        .context("share sheet anchor window unavailable")?;
+    let view = window
+        .contentView()
+        .context("share sheet anchor view unavailable")?;
+    let frame = view.frame();
+    let anchor = NSRect::new(
+        NSPoint::new(frame.size.width * 0.5, frame.size.height * 0.25),
+        NSSize::new(1.0, 1.0),
+    );
+    picker.showRelativeToRect_ofView_preferredEdge(anchor, &view, NSRectEdge::MaxY);
+
+    Ok(picker)
+}
+
+fn share_items_for_clip(item: &ClipItem, data_dir: &Path) -> Result<Vec<Retained<AnyObject>>> {
+    match item.kind {
+        ClipKind::Text | ClipKind::Email | ClipKind::Phone => {
+            let text = item.text.as_deref().context("missing text payload")?;
+            Ok(vec![retained_as_any(NSString::from_str(text))])
+        }
+        ClipKind::Url => {
+            let text = item.text.as_deref().context("missing URL payload")?;
+            let url = share_url_from_text(text)
+                .unwrap_or_else(|| retained_as_any(NSString::from_str(text)));
+            Ok(vec![url])
+        }
+        ClipKind::FilePath => {
+            let paths = file_paths_for_item(item);
+            share_file_urls(&paths)
+        }
+        ClipKind::Files => share_file_urls(&item.files),
+        ClipKind::Image => {
+            let image = item.image.as_ref().context("missing image payload")?;
+            share_file_urls(&[data_dir.join(&image.path)])
+        }
+    }
+}
+
+fn share_url_from_text(value: &str) -> Option<Retained<AnyObject>> {
+    let string = NSString::from_str(value.trim());
+    NSURL::URLWithString(&string).map(retained_as_any)
+}
+
+fn share_file_urls(paths: &[PathBuf]) -> Result<Vec<Retained<AnyObject>>> {
+    let items = paths
+        .iter()
+        .filter_map(|path| {
+            let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+            NSURL::from_file_path(canonical).map(retained_as_any)
+        })
+        .collect::<Vec<_>>();
+
+    if items.is_empty() {
+        anyhow::bail!("missing file payload")
+    }
+
+    Ok(items)
+}
+
+fn retained_as_any<T: Message>(object: Retained<T>) -> Retained<AnyObject> {
+    unsafe { Retained::cast_unchecked(object) }
 }
 
 fn frontmost_application_pid() -> Option<i32> {
@@ -2529,11 +2765,38 @@ fn normalize_loaded_item(item: &mut ClipItem) -> bool {
         return true;
     }
 
+    if !item.files.is_empty() {
+        let summary = summary_for_files(&item.files);
+        let changed = item.kind != ClipKind::Files || item.summary != summary;
+        item.kind = ClipKind::Files;
+        item.summary = summary;
+        return changed;
+    }
+
     false
 }
 
 fn summary_for_text(text: &str) -> String {
     summarize_text(&mask_sensitive_text(text))
+}
+
+fn summary_for_files(paths: &[PathBuf]) -> String {
+    match paths {
+        [] => "No files".to_owned(),
+        [path] => path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_owned)
+            .unwrap_or_else(|| path.display().to_string()),
+        [first, rest @ ..] => {
+            let name = first
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+                .unwrap_or_else(|| first.display().to_string());
+            format!("{name} + {} more", rest.len())
+        }
+    }
 }
 
 fn classify_text(text: &str) -> ClipKind {
@@ -2585,6 +2848,18 @@ fn file_path_from_text(text: &str) -> Option<PathBuf> {
     };
 
     candidate.exists().then_some(candidate)
+}
+
+fn file_paths_for_item(item: &ClipItem) -> Vec<PathBuf> {
+    if item.kind == ClipKind::Files {
+        return item.files.clone();
+    }
+
+    item.text
+        .as_deref()
+        .and_then(file_path_from_text)
+        .into_iter()
+        .collect()
 }
 
 fn strip_wrapping_quotes(value: &str) -> &str {
@@ -2968,6 +3243,46 @@ mod tests {
     }
 
     #[test]
+    fn parses_existing_file_urls() {
+        let path =
+            std::env::temp_dir().join(format!("better-clipboard-file-url-{}", Uuid::new_v4()));
+        fs::write(&path, "test").expect("write temp file");
+        let url = Url::from_file_path(&path).expect("file URL");
+
+        assert_eq!(
+            file_path_from_file_url_string(url.as_str()),
+            Some(path.clone())
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn file_history_items_keep_paths_without_copying_files() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "better-clipboard-file-history-test-{}",
+            Uuid::new_v4()
+        ));
+        let file_a = data_dir.join("first.txt");
+        let file_b = data_dir.join("second.txt");
+        fs::create_dir_all(&data_dir).expect("create temp dir");
+        fs::write(&file_a, "first").expect("write first file");
+        fs::write(&file_b, "second").expect("write second file");
+        let mut store = HistoryStore::new(data_dir.clone(), DEFAULT_HISTORY_LIMIT);
+
+        store
+            .push(file_snapshot(&[file_a.clone(), file_b.clone()]))
+            .expect("push file item");
+
+        assert_eq!(store.items.len(), 1);
+        assert_eq!(store.items[0].kind, ClipKind::Files);
+        assert_eq!(store.items[0].files, vec![file_a, file_b]);
+        assert_eq!(store.items[0].summary, "first.txt + 1 more");
+
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
     fn masks_sensitive_display_values_without_changing_raw_text() {
         let raw = "card 4111 1111 1111 1111 and key sk-proj-abcdefghijklmnopqrstuvwxyz123456";
         let item = ClipItem::from_text(raw.to_owned(), "hash".to_owned());
@@ -2985,6 +3300,19 @@ mod tests {
         hasher.update(text.as_bytes());
         ClipboardSnapshot::Text {
             text: text.to_owned(),
+            hash: hasher.finalize().to_hex().to_string(),
+        }
+    }
+
+    fn file_snapshot(paths: &[PathBuf]) -> ClipboardSnapshot {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"files:");
+        for path in paths {
+            hasher.update(path.to_string_lossy().as_bytes());
+            hasher.update(b"\0");
+        }
+        ClipboardSnapshot::Files {
+            paths: paths.to_vec(),
             hash: hasher.finalize().to_hex().to_string(),
         }
     }

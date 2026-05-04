@@ -1,16 +1,16 @@
 # Better Clipboard Help
 
-Better Clipboard is a macOS clipboard history palette. It keeps recent text, URLs, file paths, email addresses, phone numbers, and images available from the menu bar and from global shortcuts.
+Better Clipboard is a macOS clipboard history palette. It keeps recent text, URLs, file paths, file-list clipboard entries, email addresses, phone numbers, and images available from the menu bar and from global shortcuts.
 
 ## Current Status
 
 The main device workflow is the supported path right now: open the palette, move through history with the keyboard, press `Enter`, and paste into the previously focused app.
 
-Known gaps remain. The row layout is still being refined, and the Share action is unreliable. Use `C` to copy an item to the clipboard when you need to move it elsewhere.
+Native Share now opens the macOS share sheet above the palette. File-list clipboard entries are stored as references to the original files, so Better Clipboard does not make extra file copies.
 
 ## Core Workflow
 
-1. Copy text, a URL, a file path, an email address, a phone number, or an image in any app.
+1. Copy text, a URL, a file path, files from Finder, an email address, a phone number, or an image in any app.
 2. Press `Option+Space` to open Better Clipboard.
 3. The newest clipboard item is selected automatically.
 4. Press `Enter` to paste it back into the app you were using.
@@ -22,14 +22,14 @@ Click an item's left type tile to run its default action:
 
 - Text copies to the clipboard without pasting. That also moves the item to the top of the history so it behaves like the newest copied item.
 - URLs open in the default browser.
-- File paths reveal in Finder.
+- File paths and Finder file-list entries reveal in Finder.
 - Email addresses open a mail composer.
 - Phone numbers open the system phone handler.
 - Images open the larger floating preview.
 
 The action button is separate from row activation. Pressing `Enter` or double-clicking any row still pastes that item into the previously active app.
 
-Each row also includes bottom-right action buttons for the selected item's useful actions, such as Paste/`Enter`, Copy/`C`, Open/`O`, Finder/`F`, Preview/`Right`, and Share/`S`. Share is currently a known issue.
+Each row also includes bottom-right action buttons for the selected item's useful actions, such as Paste/`Enter`, Copy/`C`, Open/`O`, Finder/`F`, Preview/`Right`, and Share/`S`. Share opens the macOS share sheet and keeps Better Clipboard open after the sheet is dismissed.
 
 ## Shortcuts
 
@@ -42,12 +42,12 @@ Each row also includes bottom-right action buttons for the selected item's usefu
 | `Double-click` | Paste the clicked history item into the previously focused app. |
 | `Escape` | Close the palette without copying or pasting. |
 | `Up` / `Down` | Expand the list and move the selected item. |
-| `Right Arrow` | Open a 50% image preview, or zoom an open image preview to 100%. |
-| `Left Arrow` | Step an image preview back from 100% to 50%, or close it from 50%. |
+| `Right Arrow` | Open a centered image preview for the selected image item. |
+| `Left Arrow` | Close the image preview. |
 | `C` | Copy the selected item without pasting, then close the palette. |
 | `O` | Open the selected URL, file path, email address, or phone number. |
-| `F` | Reveal the selected file path in Finder. |
-| `S` | Known issue: intended to copy the selected item for sharing, but not reliable yet. |
+| `F` | Reveal the selected file path or file-list item in Finder. |
+| `S` | Open the macOS share sheet for the selected item. |
 | `Cmd+Down` | Expand the list. |
 | `Tab` | Expand the list. |
 | `Cmd+Up` | Collapse the list. |
@@ -56,9 +56,9 @@ Each row also includes bottom-right action buttons for the selected item's usefu
 
 The compact palette shows the newest clipboard items with fixed-height, left-aligned rows and an action button for each item. The selected row is the item that will paste when you press `Enter`.
 
-Each row keeps the clipboard data on the left, item metadata underneath it, and compact action buttons in the bottom-right corner. Each button is clickable and includes its keyboard shortcut underneath the icon, so the row can be operated with either mouse or keyboard.
+Each row keeps the clipboard data on the left, then places item metadata in the bottom-left strip and compact action buttons in the bottom-right strip. Each button is clickable and includes its keyboard shortcut underneath the icon, so the row can be operated with either mouse or keyboard.
 
-The list automatically scrolls as you move the selected row with the keyboard.
+The list automatically scrolls as you move the selected row with the keyboard. Mouse wheel scrolling expands the compact palette on the first scroll and then leaves the scroll position under your control.
 
 Use the chevron button to expand or collapse the list. Expanded mode shows more history at once, which is useful when searching visually through recent clips.
 
@@ -73,6 +73,7 @@ Better Clipboard recognizes:
 - Text: click the left type tile to copy it and move it to the top of history, or press `C` to copy it without moving it to the top.
 - URL: click the action button or press `O` to open it.
 - File path: click the action button or press `F` to reveal it in Finder; press `O` to open it.
+- Files: copy files from Finder to store file references; press `F` to reveal the first file in Finder, `O` to open the files, or `S` to share them.
 - Email: click the action button or press `O` to compose an email.
 - Phone: click the action button or press `O` to hand it to macOS as a `tel:` link.
 - Image: click the action button or press `Right Arrow` to preview it.
@@ -87,12 +88,12 @@ Masking only affects the row text shown in the palette. The raw clipboard payloa
 
 ## Image Preview
 
-Select an image item and press `Right Arrow` to open a centered image-only floating preview. The first preview is scaled to about 50% of the original display size, accounting for Retina scaling, and capped so it stays practical on screen. Press `Right Arrow` again to move to 100% scale.
+Select an image item and press `Right Arrow` to open a centered image-only floating preview. The preview is scaled to about 50% of the original display size, accounting for Retina scaling, and capped so it stays practical on screen.
 
 While the preview is open:
 
-- `Left Arrow` steps the preview from 100% back to 50%, then closes it from 50%.
-- `Escape` follows the same path as `Left Arrow`.
+- `Left Arrow` closes the preview.
+- `Escape` closes the preview.
 - `Enter` closes the preview, hides the palette, and pastes the image into the previously focused app.
 
 ## Settings
@@ -135,6 +136,5 @@ macOS does not expose a complete event queue of clipboard payloads. If another a
 
 ## Known Issues
 
-- Row layout and action-button spacing still need polish.
-- Share is not release-ready. Use `C` to copy the selected item instead.
+- Native Share should be tested across item types because available share targets are controlled by macOS and installed apps.
 - If automatic paste fails, the selected item should still be on the clipboard for manual `Cmd+V`.

@@ -2,19 +2,19 @@
 
 Better Clipboard is a small macOS clipboard history app written in Rust.
 
-It watches `NSPasteboard.changeCount` and only reads clipboard contents when macOS reports a change. Text, URLs, file paths, email addresses, phone numbers, and images are stored locally, and the palette can be opened with `Option+Space`, `Cmd+Option+Space`, `Cmd+Option+\`, or from the 📋 menu bar icon.
+It watches `NSPasteboard.changeCount` and only reads clipboard contents when macOS reports a change. Text, URLs, file paths, file-list clipboard entries, email addresses, phone numbers, and images are stored locally, and the palette can be opened with `Option+Space`, `Cmd+Option+Space`, `Cmd+Option+\`, or from the 📋 menu bar icon.
 
 ## Current Status
 
 The core workflow is working: copy items, open Better Clipboard, select history with the keyboard, and press `Enter` to paste into the app that was focused before the palette opened.
 
-Known issues remain. Some row layout details still need polish, especially around action-button spacing and visual hierarchy. The Share button is not reliable yet and should be treated as unfinished; use `C` to copy an item to the clipboard for now.
+The current build also supports native macOS sharing from each row and captures Finder-style file clipboard entries as references to the original files. It does not duplicate copied files into Better Clipboard storage.
 
 Escape, pressing the shortcut again, or clicking into another app cancels the palette without copying or pasting. Use the menu bar icon's Quit item to exit the app.
 
 When the palette opens, the newest item is selected. Press Enter or double-click an item to copy it, hide Better Clipboard, reactivate the app that was focused before the palette opened, and send `Cmd+V`. If macOS blocks the synthetic paste event, the item is still on the clipboard.
 
-Click an item's left type tile to run its default action: text copies to the clipboard, URLs open in the default browser, file paths reveal in Finder, email addresses open a mail composer, phone numbers open the system phone handler, and images open a larger floating preview. Bottom-right row buttons expose the keyboard actions directly: Paste/`Enter`, Copy/`C`, Open/`O`, Finder/`F`, Preview/`Right`, and Share/`S` where relevant. Share is currently a known issue. Pressing `Enter` or double-clicking any row still pastes that item into the previously active app.
+Click an item's left type tile to run its default action: text copies to the clipboard, URLs open in the default browser, file paths and file-list entries reveal in Finder, email addresses open a mail composer, phone numbers open the system phone handler, and images open a larger floating preview. Bottom-right row buttons expose the keyboard actions directly: Paste/`Enter`, Copy/`C`, Open/`O`, Finder/`F`, Preview/`Right`, and Share/`S` where relevant. Share opens the macOS share sheet above Better Clipboard and leaves the palette open when the sheet is dismissed. Pressing `Enter` or double-clicking any row still pastes that item into the previously active app.
 
 Sensitive-looking values such as Luhn-valid credit card numbers and common API key formats are masked in the palette display. The original value is still kept as the clipboard payload so paste and copy actions use the real value.
 
@@ -29,12 +29,12 @@ macOS does not expose an event queue of past clipboard contents, so very rapid c
 - `Double-click`: paste that item into the previously focused app.
 - `Escape`: cancel without changing the clipboard.
 - `Up` / `Down`: expand the list and move selection.
-- `Right Arrow`: preview the selected image item; press again for 100% scale.
-- `Left Arrow`: step the image preview back from 100% to 50%, or close it from 50%.
+- `Right Arrow`: preview the selected image item.
+- `Left Arrow`: close the image preview.
 - `C`: copy the selected item without pasting, then close the palette.
 - `O`: open the selected URL, file path, email address, or phone number.
-- `F`: reveal the selected file path in Finder.
-- `S`: known issue; intended to copy the selected item for sharing, but not reliable yet.
+- `F`: reveal the selected file path or file-list item in Finder.
+- `S`: open the macOS share sheet for the selected item.
 - `Cmd+Down` or `Tab`: expand the list.
 - `Cmd+Up`: collapse the list.
 
@@ -42,7 +42,7 @@ See [docs/help.md](docs/help.md) for a fuller operating guide, [docs/manual-test
 
 ## Reporting Issues
 
-Please file layout, Share-button, paste-focus, and installation issues in GitHub Issues using the bug report or manual test report template. Include your macOS version, chip architecture, whether you ran the app bundle or `cargo run`, whether Accessibility permission is granted, and the exact shortcut or click sequence.
+Please file layout, Share-sheet, paste-focus, file-list, and installation issues in GitHub Issues using the bug report or manual test report template. Include your macOS version, chip architecture, whether you ran the app bundle or `cargo run`, whether Accessibility permission is granted, and the exact shortcut or click sequence.
 
 ## Settings
 
