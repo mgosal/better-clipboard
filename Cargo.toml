@@ -1,0 +1,30 @@
+[package]
+name = "better-clipboard"
+version = "0.1.0"
+edition = "2024"
+description = "A small macOS clipboard history palette written in Rust."
+readme = "README.md"
+license = "BSD-2-Clause"
+repository = "https://github.com/mgosal/better-clipboard"
+exclude = ["dist/**", ".DS_Store"]
+
+[dependencies]
+anyhow = "1"
+arboard = "3"
+blake3 = "1"
+chrono = { version = "0.4", features = ["serde"] }
+core-foundation = "0.9"
+core-graphics = { version = "0.23", features = ["elcapitan"] }
+directories = "6"
+eframe = "0.31"
+egui_extras = { version = "0.31", features = ["image"] }
+global-hotkey = "0.7"
+image = { version = "0.25", default-features = false, features = ["png"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tray-icon = "0.21"
+url = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "libc", "NSPasteboard", "NSRunningApplication", "NSWorkspace"] }
