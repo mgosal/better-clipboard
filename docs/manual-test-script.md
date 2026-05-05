@@ -113,7 +113,7 @@ Use this script for release testing before filing issues. The current release ca
 
 - [ ] Select an image item.
 - [ ] Press `Right Arrow`.
-- [ ] Confirm an image-only floating preview opens centered at about 50% display size.
+- [ ] Confirm an image-only floating preview opens centered at 100% display size, capped if needed to fit the screen.
 - [ ] Press `Right Arrow` again and confirm the preview remains a single fixed preview rather than zooming.
 - [ ] Press `Left Arrow` and confirm the preview closes.
 - [ ] Open the preview again, press `Escape`, and confirm only the preview closes.

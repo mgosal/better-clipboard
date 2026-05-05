@@ -88,7 +88,7 @@ Masking only affects the row text shown in the palette. The raw clipboard payloa
 
 ## Image Preview
 
-Select an image item and press `Right Arrow` to open a centered image-only floating preview. The preview is scaled to about 50% of the original display size, accounting for Retina scaling, and capped so it stays practical on screen.
+Select an image item and press `Right Arrow` to open a centered image-only floating preview. The preview is scaled to 100% of the original display size, accounting for Retina scaling, and capped so it stays practical on screen.
 
 While the preview is open:
 
