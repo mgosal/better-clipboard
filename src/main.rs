@@ -1689,13 +1689,11 @@ impl eframe::App for BetterClipboardApp {
                                         } else {
                                             ui.visuals().text_color()
                                         };
-                                        ui.add_sized(
-                                            egui::vec2(content_width, TEXT_PREVIEW_HEIGHT),
-                                            egui::Label::new(
-                                                RichText::new(&item.summary).color(text_color),
-                                            )
-                                            .wrap()
-                                            .halign(egui::Align::Min),
+                                        paint_row_summary(
+                                            ui,
+                                            &item.summary,
+                                            text_color,
+                                            content_width,
                                         );
                                         ui.allocate_ui_with_layout(
                                             egui::vec2(content_width, HINT_CHIP_HEIGHT),
@@ -1940,6 +1938,18 @@ fn selected_text(theme: ThemeMode) -> Color32 {
         ThemeMode::Light => Color32::from_rgb(26, 60, 110),
         ThemeMode::Dark => Color32::from_rgb(170, 210, 255),
     }
+}
+
+fn paint_row_summary(ui: &mut egui::Ui, summary: &str, color: Color32, width: f32) {
+    let size = egui::vec2(width, TEXT_PREVIEW_HEIGHT);
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let font_id = egui::TextStyle::Body.resolve(ui.style());
+    let galley = ui
+        .painter()
+        .layout(summary.to_owned(), font_id, color, rect.width());
+    ui.painter()
+        .with_clip_rect(rect)
+        .galley(rect.left_top(), galley, color);
 }
 
 fn muted_text(theme: ThemeMode) -> Color32 {
