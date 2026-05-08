@@ -37,8 +37,9 @@ use objc2::{
     runtime::{AnyObject, ProtocolObject},
 };
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationOptions, NSPasteboard, NSPasteboardTypeFileURL,
-    NSPasteboardWriting, NSRunningApplication, NSSharingServicePicker, NSWorkspace,
+    NSApplication, NSApplicationActivationOptions, NSBitmapImageRep, NSImage, NSPasteboard,
+    NSPasteboardType, NSPasteboardTypeFileURL, NSPasteboardWriting, NSRunningApplication,
+    NSSharingServicePicker, NSWorkspace,
 };
 use objc2_foundation::{NSArray, NSPoint, NSRect, NSRectEdge, NSSize, NSString, NSURL};
 use serde::{Deserialize, Serialize};
@@ -57,8 +58,8 @@ const ROW_HEIGHT: f32 = 118.0;
 const THUMBNAIL_SIZE: f32 = 74.0;
 const TEXT_PREVIEW_HEIGHT: f32 = 62.0;
 const PREVIEW_SCALE: f32 = 1.0;
-const PREVIEW_MAX_IMAGE_WIDTH: f32 = 1_280.0;
-const PREVIEW_MAX_IMAGE_HEIGHT: f32 = 900.0;
+const PREVIEW_MAX_IMAGE_WIDTH: f32 = 10_000.0;
+const PREVIEW_MAX_IMAGE_HEIGHT: f32 = 10_000.0;
 const HINT_CHIP_WIDTH: f32 = 58.0;
 const HINT_CHIP_HEIGHT: f32 = 48.0;
 const HINT_CHIP_GAP: f32 = 6.0;
@@ -291,6 +292,10 @@ fn read_clipboard(clipboard: &mut Clipboard) -> Option<ClipboardSnapshot> {
         });
     }
 
+    if let Some(image_data) = read_image_from_pasteboard() {
+        return Some(image_data);
+    }
+
     if let Ok(text) = clipboard.get_text() {
         let text = text.trim_end_matches('\0').to_owned();
         if !text.trim().is_empty() {
@@ -319,6 +324,37 @@ fn read_clipboard(clipboard: &mut Clipboard) -> Option<ClipboardSnapshot> {
     }
 
     None
+}
+
+fn read_image_from_pasteboard() -> Option<ClipboardSnapshot> {
+    let pasteboard = NSPasteboard::generalPasteboard();
+
+    let tiff_data = pasteboard.dataForType(unsafe { NSPasteboardType::tiff() })?;
+    let ns_image = NSImage::from_data(&tiff_data)?;
+    let rep = ns_image.representations().first()?;
+    let size = rep.pixelsWide() * rep.bitsPerPixel() / 8;
+    let width = rep.pixelsWide() as usize;
+    let height = rep.pixelsHigh() as usize;
+
+    if width == 0 || height == 0 {
+        return None;
+    }
+
+    let bitmap = rep.bitmapImageData()?;
+    let bytes = bitmap.bytes();
+    let rgba: Vec<u8> = bytes.iter().copied().collect();
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"image:");
+    hasher.update(&(width as u64).to_le_bytes());
+    hasher.update(&(height as u64).to_le_bytes());
+    hasher.update(&rgba);
+    Some(ClipboardSnapshot::Image {
+        width,
+        height,
+        rgba,
+        hash: hasher.finalize().to_hex().to_string(),
+    })
 }
 
 fn read_file_paths_from_pasteboard() -> Option<Vec<PathBuf>> {
@@ -1689,11 +1725,46 @@ impl eframe::App for BetterClipboardApp {
                                         } else {
                                             ui.visuals().text_color()
                                         };
-                                        paint_row_summary(
+paint_row_summary(
                                             ui,
                                             &item.summary,
                                             text_color,
                                             content_width,
+                                        );
+                                        ui.allocate_ui_with_layout(
+                                            egui::vec2(content_width, HINT_CHIP_HEIGHT),
+                                            egui::Layout::left_to_right(egui::Align::Center),
+                                            |ui| {
+                                                let actions_width =
+                                                    row_action_buttons_width(item.kind);
+                                                let metadata_width =
+                                                    (content_width - actions_width - 10.0).max(0.0);
+                                                ui.add_sized(
+                                                    egui::vec2(metadata_width, HINT_CHIP_HEIGHT),
+                                                    egui::Label::new(
+                                                        RichText::new(format!(
+                                                            "{} · {}",
+                                                            item.kind.label(),
+                                                            item.created_at.format("%H:%M:%S")
+                                                        ))
+                                                        .color(muted),
+                                                    )
+                                                    .truncate()
+                                                    .halign(egui::Align::Min),
+                                                );
+                                                ui.with_layout(
+                                                    egui::Layout::right_to_left(
+                                                        egui::Align::Center,
+                                                    ),
+                                                    |ui| {
+                                                        row_action = show_row_action_buttons(
+                                                            ui,
+                                                            item.kind,
+                                                            self.settings.theme,
+                                                        );
+                                                    },
+                                                );
+                                            },
                                         );
                                         ui.allocate_ui_with_layout(
                                             egui::vec2(content_width, HINT_CHIP_HEIGHT),
@@ -2177,7 +2248,10 @@ fn show_row_action_button(
         egui::pos2(rect.center().x, rect.bottom() - 7.0),
         egui::Align2::CENTER_CENTER,
         shortcut,
-        egui::FontId::proportional(8.5),
+        egui::FontId {
+            size: 8.5,
+            ..Default::default()
+        },
         muted_text(theme),
     );
     response.on_hover_text(hover_text)
@@ -3100,13 +3174,17 @@ fn mask_api_token(token: &str, sensitive_context: bool) -> Option<String> {
     if let Some(prefix) = PREFIXES
         .iter()
         .copied()
-        .find(|prefix| token.starts_with(prefix) && token.len() >= prefix.len() + 8)
+        .find(|prefix| token.starts_with(prefix) && token.len() >= prefix.len() + 4)
     {
         return Some(format!("{prefix}...{}", last_chars(token, 4)));
     }
 
     if sensitive_context && looks_like_secret_value(token) {
         return Some(format!("••••{}", last_chars(token, 4)));
+    }
+
+    if token.len() >= 20 && looks_like_secret_value(token) {
+        return Some(format!("{}...{}", &token[..4], last_chars(token, 4)));
     }
 
     None
@@ -3138,7 +3216,7 @@ fn sensitive_context_before(text: &str, start: usize) -> bool {
 }
 
 fn looks_like_secret_value(token: &str) -> bool {
-    if token.len() < 32 {
+    if token.len() < 20 {
         return false;
     }
 
