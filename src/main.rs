@@ -59,6 +59,7 @@ const TEXT_PREVIEW_HEIGHT: f32 = 62.0;
 const PREVIEW_SCALE: f32 = 1.0;
 const PREVIEW_MAX_IMAGE_WIDTH: f32 = 1_280.0;
 const PREVIEW_MAX_IMAGE_HEIGHT: f32 = 900.0;
+const PREVIEW_SCREEN_MARGIN: f32 = 64.0;
 const HINT_CHIP_WIDTH: f32 = 58.0;
 const HINT_CHIP_HEIGHT: f32 = 48.0;
 const HINT_CHIP_GAP: f32 = 6.0;
@@ -291,6 +292,10 @@ fn read_clipboard(clipboard: &mut Clipboard) -> Option<ClipboardSnapshot> {
         });
     }
 
+    if let Ok(image) = clipboard.get_image() {
+        return Some(snapshot_from_image_data(image));
+    }
+
     if let Ok(text) = clipboard.get_text() {
         let text = text.trim_end_matches('\0').to_owned();
         if !text.trim().is_empty() {
@@ -304,21 +309,21 @@ fn read_clipboard(clipboard: &mut Clipboard) -> Option<ClipboardSnapshot> {
         }
     }
 
-    if let Ok(image) = clipboard.get_image() {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(b"image:");
-        hasher.update(&(image.width as u64).to_le_bytes());
-        hasher.update(&(image.height as u64).to_le_bytes());
-        hasher.update(&image.bytes);
-        return Some(ClipboardSnapshot::Image {
-            width: image.width,
-            height: image.height,
-            rgba: image.bytes.into_owned(),
-            hash: hasher.finalize().to_hex().to_string(),
-        });
-    }
-
     None
+}
+
+fn snapshot_from_image_data(image: ImageData<'_>) -> ClipboardSnapshot {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"image:");
+    hasher.update(&(image.width as u64).to_le_bytes());
+    hasher.update(&(image.height as u64).to_le_bytes());
+    hasher.update(&image.bytes);
+    ClipboardSnapshot::Image {
+        width: image.width,
+        height: image.height,
+        rgba: image.bytes.into_owned(),
+        hash: hasher.finalize().to_hex().to_string(),
+    }
 }
 
 fn read_file_paths_from_pasteboard() -> Option<Vec<PathBuf>> {
@@ -1900,10 +1905,25 @@ fn preview_image_size(ctx: &egui::Context, width: usize, height: usize) -> egui:
     let pixels_per_point = ctx.pixels_per_point().max(1.0);
     let native_size = egui::vec2(width / pixels_per_point, height / pixels_per_point);
     let scaled = native_size * PREVIEW_SCALE;
-    let cap_scale = (PREVIEW_MAX_IMAGE_WIDTH / scaled.x)
-        .min(PREVIEW_MAX_IMAGE_HEIGHT / scaled.y)
-        .min(1.0);
+    let max_size = preview_max_image_size(ctx);
+    let cap_scale = (max_size.x / scaled.x).min(max_size.y / scaled.y).min(1.0);
     scaled * cap_scale
+}
+
+fn preview_max_image_size(ctx: &egui::Context) -> egui::Vec2 {
+    let configured_max = egui::vec2(PREVIEW_MAX_IMAGE_WIDTH, PREVIEW_MAX_IMAGE_HEIGHT);
+    let Some(monitor_size) = ctx.input(|input| input.viewport().monitor_size) else {
+        return configured_max;
+    };
+
+    let screen_max = egui::vec2(
+        (monitor_size.x - PREVIEW_SCREEN_MARGIN * 2.0).max(1.0),
+        (monitor_size.y - PREVIEW_SCREEN_MARGIN * 2.0).max(1.0),
+    );
+    egui::vec2(
+        configured_max.x.min(screen_max.x),
+        configured_max.y.min(screen_max.y),
+    )
 }
 
 fn better_clipboard_has_focus(ctx: &egui::Context) -> bool {
@@ -3100,13 +3120,17 @@ fn mask_api_token(token: &str, sensitive_context: bool) -> Option<String> {
     if let Some(prefix) = PREFIXES
         .iter()
         .copied()
-        .find(|prefix| token.starts_with(prefix) && token.len() >= prefix.len() + 8)
+        .find(|prefix| token.starts_with(prefix) && token.len() >= prefix.len() + 4)
     {
         return Some(format!("{prefix}...{}", last_chars(token, 4)));
     }
 
     if sensitive_context && looks_like_secret_value(token) {
         return Some(format!("••••{}", last_chars(token, 4)));
+    }
+
+    if token.len() >= 20 && looks_like_secret_value(token) {
+        return Some(format!("{}...{}", &token[..4], last_chars(token, 4)));
     }
 
     None
@@ -3138,7 +3162,7 @@ fn sensitive_context_before(text: &str, start: usize) -> bool {
 }
 
 fn looks_like_secret_value(token: &str) -> bool {
-    if token.len() < 32 {
+    if token.len() < 20 {
         return false;
     }
 
@@ -3302,6 +3326,16 @@ mod tests {
         assert!(item.summary.contains("sk-proj-...3456"));
         assert!(!item.summary.contains("4111 1111 1111 1111"));
         assert!(!item.summary.contains("abcdefghijklmnopqrstuvwxyz"));
+    }
+
+    #[test]
+    fn masks_shorter_prefixed_api_tokens() {
+        assert_eq!(mask_api_tokens("token sk-test1234"), "token sk-...1234");
+    }
+
+    #[test]
+    fn masks_unlabelled_secret_like_values() {
+        assert_eq!(mask_api_tokens("abc123def456ghi789jk"), "abc1...89jk");
     }
 
     fn text_snapshot(text: &str) -> ClipboardSnapshot {
