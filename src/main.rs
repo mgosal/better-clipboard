@@ -1742,13 +1742,15 @@ impl eframe::App for BetterClipboardApp {
                     });
                     ui.add(egui::Separator::default().spacing(4.0));
                 } else {
-                    // / search hint shown in footer when palette is idle
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(
-                            RichText::new("/ to search")
-                                .size(10.0)
-                                .color(muted),
-                        );
+                    // / search hint — constrained to a single row so it doesn't consume the panel
+                    ui.horizontal(|ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(
+                                RichText::new("/ to search")
+                                    .size(10.0)
+                                    .color(muted),
+                            );
+                        });
                     });
                     ui.add_space(2.0);
                 }
