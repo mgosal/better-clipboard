@@ -1881,19 +1881,7 @@ impl BetterClipboardApp {
 
         let action = ctx.show_viewport_immediate(image_preview_viewport_id(), builder, |ctx, _| {
             apply_theme(ctx, theme);
-
-            if ctx.input(|input| input.viewport().close_requested()) {
-                return PreviewAction::Close;
-            }
-            if ctx.input(|input| input.key_pressed(Key::Escape)) {
-                return PreviewAction::Close;
-            }
-            if ctx.input(|input| input.key_pressed(Key::ArrowLeft)) {
-                return PreviewAction::Close;
-            }
-            if ctx.input(|input| input.key_pressed(Key::Enter)) {
-                return PreviewAction::Paste;
-            }
+            let mut result = PreviewAction::None;
 
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE.fill(Color32::TRANSPARENT).inner_margin(0))
@@ -1913,7 +1901,40 @@ impl BetterClipboardApp {
                     }
                 });
 
-            PreviewAction::None
+            let close_clicked = egui::Area::new(egui::Id::new("preview_close"))
+                .fixed_pos(egui::pos2(image_size.x - 82.0, 10.0))
+                .show(ctx, |ui| {
+                    let (rect, response) =
+                        ui.allocate_exact_size(egui::vec2(74.0, 26.0), egui::Sense::click());
+                    let bg = if response.hovered() {
+                        Color32::from_rgba_unmultiplied(50, 50, 50, 220)
+                    } else {
+                        Color32::from_rgba_unmultiplied(20, 20, 20, 180)
+                    };
+                    ui.painter().rect_filled(rect, CornerRadius::same(5), bg);
+                    ui.painter().text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "✕  Esc",
+                        egui::FontId::proportional(11.0),
+                        Color32::WHITE,
+                    );
+                    response.clicked()
+                })
+                .inner;
+
+            if close_clicked
+                || ctx.input(|input| input.viewport().close_requested())
+                || ctx.input(|input| input.key_pressed(Key::Escape))
+                || ctx.input(|input| input.key_pressed(Key::ArrowLeft))
+            {
+                result = PreviewAction::Close;
+            }
+            if ctx.input(|input| input.key_pressed(Key::Enter)) {
+                result = PreviewAction::Paste;
+            }
+
+            result
         });
 
         match action {
