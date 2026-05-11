@@ -1,6 +1,6 @@
 # Manual Test Script
 
-Use this script for release testing before filing issues. The current release candidate should cover the core keyboard workflow, native Share, file-list capture, and the compact-to-expanded scroll behavior.
+Use this script for release testing before filing issues. The current release candidate should cover the core keyboard workflow, native Share, file-list capture, the compact-to-expanded scroll behavior, image capture, sensitive value masking, and image preview.
 
 ## Current Known Issues
 
@@ -9,8 +9,8 @@ Use this script for release testing before filing issues. The current release ca
 
 ## Setup
 
-- [ ] Build the app with `./scripts/build-macos-app.sh`.
-- [ ] Open `dist/Better Clipboard.app`.
+- [ ] Download `Better-Clipboard-vX.X.X-macOS.zip` from the [Releases page](https://github.com/mgosal/better-clipboard/releases) and unzip it, **or** build from source with `./scripts/build-macos-app.sh`.
+- [ ] Move `Better Clipboard.app` to `/Applications` and open it from there.
 - [ ] Confirm Better Clipboard shows its own permission explanation before macOS opens System Settings or the Accessibility prompt.
 - [ ] Grant Accessibility permission when prompted.
 - [ ] Confirm the 📋 menu bar item appears.
@@ -23,18 +23,20 @@ Use this script for release testing before filing issues. The current release ca
 - [ ] Copy one or more files in Finder.
 - [ ] Copy an email address.
 - [ ] Copy a phone number.
-- [ ] Copy an image.
+- [ ] Copy an image (e.g. right-click an image in Safari → Copy Image).
 - [ ] Open Better Clipboard with `Option+Space`.
 - [ ] Confirm all copied items appear in newest-first order.
 - [ ] Confirm text, URL, file path, file-list, email, and phone rows are left-aligned.
-- [ ] Confirm each row shows an action button.
-- [ ] Confirm clickable action buttons appear in the bottom-right of each row, with keyboard shortcuts underneath the icons.
-- [ ] Confirm metadata appears bottom-left on the same bottom row as the action buttons.
+- [ ] Confirm each row shows an action tile on the left and action buttons on the bottom-right.
+- [ ] Confirm keyboard shortcut labels on action buttons appear in **bold**.
+- [ ] Confirm metadata (type · time) appears bottom-left on the same row as the action buttons.
 - [ ] Confirm image row tiles fill the row height.
 - [ ] Note any row spacing, clipping, alignment, or hierarchy issues for a GitHub layout issue.
 - [ ] Copy a test credit card number such as `4111 1111 1111 1111`.
-- [ ] Copy a test API key-shaped value such as `sk-proj-abcdefghijklmnopqrstuvwxyz123456`.
-- [ ] Confirm sensitive-looking values are masked in the row summary.
+- [ ] Confirm it is masked as `•••• •••• •••• 1111` in the row summary.
+- [ ] Copy a test API key such as `sk-proj-abcdefghijklmnopqrstuvwxyz123456`.
+- [ ] Confirm it is masked as `sk-proj-...3456` in the row summary.
+- [ ] Confirm the original unmasked value is pasted when pressing `Enter`.
 
 ## Keyboard Navigation
 
@@ -42,7 +44,7 @@ Use this script for release testing before filing issues. The current release ca
 - [ ] Confirm the selected row stays visible as the list scrolls.
 - [ ] Press `Up` repeatedly.
 - [ ] Confirm the selected row stays visible while moving upward.
-- [ ] Reopen in compact mode, scroll the mouse wheel once, and confirm the palette expands past 3 items without snapping back to the selected row.
+- [ ] Reopen in compact mode (default on open), scroll the mouse wheel once, and confirm the palette expands past 3 items without snapping back to the selected row.
 - [ ] Continue mouse scrolling and confirm the scroll position stays under mouse control.
 - [ ] Select a URL item and press `O`.
 - [ ] Confirm the URL opens in the default browser.
@@ -101,29 +103,24 @@ Use this script for release testing before filing issues. The current release ca
 - [ ] Reopen Better Clipboard and click the bottom-right `Share` / `S` button.
 - [ ] Confirm the native macOS share sheet opens above Better Clipboard and the palette remains open after the sheet is dismissed.
 
-## Known Issue Filing
-
-- [ ] File one GitHub issue for row layout problems, with screenshots and notes about window size, selected item type, and whether compact or expanded mode was used.
-- [ ] File one GitHub issue for Share behavior, with the exact item type, whether mouse or `S` was used, the destination app, and what happened to focus and clipboard contents.
-- [ ] File one GitHub issue for file-list behavior if copied Finder files do not appear, open, reveal, share, or paste as expected.
-- [ ] File separate issues for paste-focus problems, image-preview problems, install/startup problems, or permission problems.
-- [ ] Use the manual test report template if reporting a full pass/fail run.
-
 ## Image Preview
 
 - [ ] Select an image item.
 - [ ] Press `Right Arrow`.
-- [ ] Confirm an image-only floating preview opens centered at 100% display size, capped if needed to fit the screen.
-- [ ] Press `Right Arrow` again and confirm the preview remains a single fixed preview rather than zooming.
+- [ ] Confirm an image-only floating preview opens centred at the image's native pixel size.
+- [ ] Confirm a `✕ Esc` close button is visible in the top-right corner of the preview.
+- [ ] Click the `✕ Esc` button and confirm the preview closes without closing the palette.
+- [ ] Reopen the preview with `Right Arrow`.
+- [ ] Press `Right Arrow` again and confirm the preview remains a single fixed window rather than zooming or opening a second preview.
 - [ ] Press `Left Arrow` and confirm the preview closes.
 - [ ] Open the preview again, press `Escape`, and confirm only the preview closes.
 - [ ] Open the preview again, then press `Enter`.
-- [ ] Confirm the preview and palette close, then the image is pasted into the original app.
+- [ ] Confirm the preview and palette both close and the image is pasted into the original app.
 
 ## Settings
 
 - [ ] Open settings with the `⚙` button.
-- [ ] Switch between light and dark theme.
+- [ ] Switch between light and dark theme and confirm the palette updates immediately.
 - [ ] Change the history limit and confirm it persists after restart.
 - [ ] Enable `Run at login`.
 - [ ] Confirm `~/Library/LaunchAgents/com.mgosal.better-clipboard.plist` is created.
@@ -143,9 +140,9 @@ Use this script for release testing before filing issues. The current release ca
 When filing an issue, include:
 
 - macOS version.
-- Chip architecture, such as Apple silicon or Intel.
-- Whether the app was run from `dist/Better Clipboard.app` or `cargo run`.
+- Chip architecture (Apple silicon or Intel).
+- App source: release zip from the Releases page, `dist/Better Clipboard.app` built locally, or `cargo run`.
 - Whether Accessibility permission was granted.
-- Exact shortcut or click sequence.
+- Exact shortcut or click sequence that triggered the issue.
 - Expected result and actual result.
-- Screenshots or screen recordings for visual/layout issues.
+- Screenshots or screen recordings for visual or layout issues.

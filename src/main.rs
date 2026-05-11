@@ -57,8 +57,8 @@ const ROW_HEIGHT: f32 = 118.0;
 const THUMBNAIL_SIZE: f32 = 74.0;
 const TEXT_PREVIEW_HEIGHT: f32 = 62.0;
 const PREVIEW_SCALE: f32 = 1.0;
-const PREVIEW_MAX_IMAGE_WIDTH: f32 = 1_280.0;
-const PREVIEW_MAX_IMAGE_HEIGHT: f32 = 900.0;
+const PREVIEW_MAX_IMAGE_WIDTH: f32 = 10_000.0;
+const PREVIEW_MAX_IMAGE_HEIGHT: f32 = 10_000.0;
 const HINT_CHIP_WIDTH: f32 = 58.0;
 const HINT_CHIP_HEIGHT: f32 = 48.0;
 const HINT_CHIP_GAP: f32 = 6.0;
@@ -291,19 +291,9 @@ fn read_clipboard(clipboard: &mut Clipboard) -> Option<ClipboardSnapshot> {
         });
     }
 
-    if let Ok(text) = clipboard.get_text() {
-        let text = text.trim_end_matches('\0').to_owned();
-        if !text.trim().is_empty() {
-            let mut hasher = blake3::Hasher::new();
-            hasher.update(b"text:");
-            hasher.update(text.as_bytes());
-            return Some(ClipboardSnapshot::Text {
-                text,
-                hash: hasher.finalize().to_hex().to_string(),
-            });
-        }
-    }
-
+    // Check image before text: Safari (and other browsers) place both image data
+    // and a text URL on the pasteboard when copying an image. Checking image first
+    // ensures we capture the actual image rather than the URL text.
     if let Ok(image) = clipboard.get_image() {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"image:");
@@ -316,6 +306,19 @@ fn read_clipboard(clipboard: &mut Clipboard) -> Option<ClipboardSnapshot> {
             rgba: image.bytes.into_owned(),
             hash: hasher.finalize().to_hex().to_string(),
         });
+    }
+
+    if let Ok(text) = clipboard.get_text() {
+        let text = text.trim_end_matches('\0').to_owned();
+        if !text.trim().is_empty() {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"text:");
+            hasher.update(text.as_bytes());
+            return Some(ClipboardSnapshot::Text {
+                text,
+                hash: hasher.finalize().to_hex().to_string(),
+            });
+        }
     }
 
     None
@@ -727,6 +730,9 @@ struct BetterClipboardApp {
     focus_loss_started: Option<Instant>,
     scroll_selected_into_view: bool,
     last_repaint: Instant,
+    search_active: bool,
+    search_query: String,
+    search_focus_requested: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -781,6 +787,9 @@ impl BetterClipboardApp {
             focus_loss_started: None,
             scroll_selected_into_view: false,
             last_repaint: Instant::now(),
+            search_active: false,
+            search_query: String::new(),
+            search_focus_requested: false,
         }
     }
 
@@ -852,6 +861,9 @@ impl BetterClipboardApp {
         self.settings_open = false;
         self.permission_onboarding = false;
         self.focus_loss_started = None;
+        self.search_active = false;
+        self.search_query.clear();
+        self.search_focus_requested = false;
         self.close_image_preview(ctx);
         self.close_share_picker();
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
@@ -1275,10 +1287,6 @@ impl BetterClipboardApp {
         let escape = ctx.input(|input| input.key_pressed(Key::Escape));
         let right = ctx.input(|input| input.key_pressed(Key::ArrowRight));
         let left = ctx.input(|input| input.key_pressed(Key::ArrowLeft));
-        let open = ctx.input(|input| input.key_pressed(Key::O));
-        let copy = ctx.input(|input| input.key_pressed(Key::C));
-        let finder = ctx.input(|input| input.key_pressed(Key::F));
-        let share = ctx.input(|input| input.key_pressed(Key::S));
 
         if self.preview_item.is_some() {
             if right {
@@ -1293,7 +1301,7 @@ impl BetterClipboardApp {
                     self.copy_and_paste_item(&visible_items[index], data_dir, ctx);
                 }
             }
-            if copy {
+            if ctx.input(|input| input.key_pressed(Key::C)) {
                 if let Some(index) = self.selected_index(visible_items) {
                     let item = &visible_items[index];
                     self.copy_item_and_hide(
@@ -1304,7 +1312,7 @@ impl BetterClipboardApp {
                     );
                 }
             }
-            if share {
+            if ctx.input(|input| input.key_pressed(Key::S)) {
                 if let Some(index) = self.selected_index(visible_items) {
                     let item = &visible_items[index];
                     self.close_image_preview(ctx);
@@ -1315,11 +1323,48 @@ impl BetterClipboardApp {
         }
 
         if escape {
-            self.hide_window(ctx);
+            if self.search_active && !self.search_query.is_empty() {
+                self.search_query.clear();
+                self.select_first_on_show = true;
+            } else {
+                self.search_active = false;
+                self.search_query.clear();
+                self.search_focus_requested = false;
+                self.hide_window(ctx);
+            }
             return;
         }
 
         if self.settings_open {
+            return;
+        }
+
+        // While search is active: only navigate (↑↓ Enter) — all letter keys feed the text field.
+        if self.search_active {
+            if down {
+                self.move_selection(visible_items, 1);
+                self.scroll_selected_into_view = true;
+            }
+            if up {
+                self.move_selection(visible_items, -1);
+                self.scroll_selected_into_view = true;
+            }
+            if enter {
+                if let Some(index) = self.selected_index(visible_items) {
+                    self.copy_and_paste_item(&visible_items[index], data_dir, ctx);
+                }
+            }
+            return;
+        }
+
+        // / opens search
+        let slash = ctx.input(|input| input.key_pressed(Key::Slash));
+        if slash {
+            self.search_active = true;
+            self.search_query.clear();
+            self.search_focus_requested = true;
+            self.select_first_on_show = true;
+            self.set_expanded(true, ctx);
             return;
         }
 
@@ -1346,12 +1391,12 @@ impl BetterClipboardApp {
                 self.open_image_preview(&visible_items[index], ctx);
             }
         }
-        if open {
+        if ctx.input(|input| input.key_pressed(Key::O)) {
             if let Some(index) = self.selected_index(visible_items) {
                 self.open_item(&visible_items[index], data_dir, ctx);
             }
         }
-        if copy {
+        if ctx.input(|input| input.key_pressed(Key::C)) {
             if let Some(index) = self.selected_index(visible_items) {
                 let item = &visible_items[index];
                 self.copy_item_and_hide(
@@ -1362,7 +1407,7 @@ impl BetterClipboardApp {
                 );
             }
         }
-        if finder {
+        if ctx.input(|input| input.key_pressed(Key::F)) {
             if let Some(index) = self.selected_index(visible_items) {
                 if matches!(
                     visible_items[index].kind,
@@ -1372,7 +1417,7 @@ impl BetterClipboardApp {
                 }
             }
         }
-        if share {
+        if ctx.input(|input| input.key_pressed(Key::S)) {
             if let Some(index) = self.selected_index(visible_items) {
                 self.share_item(&visible_items[index], data_dir);
             }
@@ -1570,7 +1615,16 @@ impl eframe::App for BetterClipboardApp {
             }
         };
 
-        let visible_items = items.clone();
+        let all_items = items.clone();
+        let visible_items: Vec<ClipItem> = if self.search_active && !self.search_query.is_empty() {
+            let query = self.search_query.to_lowercase();
+            all_items
+                .into_iter()
+                .filter(|item| item.summary.to_lowercase().contains(&query))
+                .collect()
+        } else {
+            all_items
+        };
         self.ensure_selection(&visible_items);
         self.handle_keyboard(ctx, &visible_items, &data_dir);
         self.handle_scroll_intent(ctx, visible_items.len());
@@ -1598,7 +1652,9 @@ impl eframe::App for BetterClipboardApp {
                     ui.label(RichText::new("📋").size(22.0));
                     ui.label(RichText::new(APP_NAME).strong().size(18.0));
                     ui.separator();
-                    let count_text = if self.palette_expanded {
+                    let count_text = if self.search_active && !self.search_query.is_empty() {
+                        format!("{} match{}", visible_items.len(), if visible_items.len() == 1 { "" } else { "es" })
+                    } else if self.palette_expanded {
                         format!("{} items", visible_items.len())
                     } else if visible_items.is_empty() {
                         "0 items".to_owned()
@@ -1635,9 +1691,77 @@ impl eframe::App for BetterClipboardApp {
                     return;
                 }
 
+                // Search bar — shown when / has been pressed
+                if self.search_active {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("🔍").size(13.0).color(muted));
+                        let search_field = egui::TextEdit::singleline(&mut self.search_query)
+                            .hint_text("Search history…")
+                            .desired_width(f32::INFINITY)
+                            .frame(false);
+                        let response = ui.add(search_field);
+                        // Request focus only on the first frame after search is activated
+                        if self.search_focus_requested {
+                            response.request_focus();
+                            self.search_focus_requested = false;
+                        }
+                        if response.changed() {
+                            self.select_first_on_show = true;
+                        }
+                        if !self.search_query.is_empty()
+                            && ui
+                                .small_button(RichText::new("×").color(muted))
+                                .on_hover_text("Clear search (Esc)")
+                                .clicked()
+                        {
+                            self.search_query.clear();
+                            self.select_first_on_show = true;
+                        }
+                    });
+                    // Shortcut hint strip
+                    ui.horizontal(|ui| {
+                        ui.add_space(2.0);
+                        for (key, desc) in [
+                            ("↑↓", "navigate"),
+                            ("Enter", "paste"),
+                            ("Esc", "clear / close"),
+                        ] {
+                            ui.label(
+                                RichText::new(key)
+                                    .strong()
+                                    .size(10.0)
+                                    .color(muted),
+                            );
+                            ui.label(
+                                RichText::new(desc)
+                                    .size(10.0)
+                                    .color(muted),
+                            );
+                            ui.label(RichText::new("·").size(10.0).color(muted));
+                        }
+                    });
+                    ui.add(egui::Separator::default().spacing(4.0));
+                } else {
+                    // / search hint — constrained to a single row so it doesn't consume the panel
+                    ui.horizontal(|ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(
+                                RichText::new("/ to search")
+                                    .size(10.0)
+                                    .color(muted),
+                            );
+                        });
+                    });
+                    ui.add_space(2.0);
+                }
+
                 if visible_items.is_empty() {
                     ui.centered_and_justified(|ui| {
-                        ui.label("Copy text, a URL, or an image to start building history.");
+                        if self.search_active && !self.search_query.is_empty() {
+                            ui.label(format!("No matches for \"{}\"", self.search_query));
+                        } else {
+                            ui.label("Copy text, a URL, or an image to start building history.");
+                        }
                     });
                     return;
                 }
@@ -1689,7 +1813,7 @@ impl eframe::App for BetterClipboardApp {
                                         } else {
                                             ui.visuals().text_color()
                                         };
-                                        paint_row_summary(
+paint_row_summary(
                                             ui,
                                             &item.summary,
                                             text_color,
@@ -1810,19 +1934,7 @@ impl BetterClipboardApp {
 
         let action = ctx.show_viewport_immediate(image_preview_viewport_id(), builder, |ctx, _| {
             apply_theme(ctx, theme);
-
-            if ctx.input(|input| input.viewport().close_requested()) {
-                return PreviewAction::Close;
-            }
-            if ctx.input(|input| input.key_pressed(Key::Escape)) {
-                return PreviewAction::Close;
-            }
-            if ctx.input(|input| input.key_pressed(Key::ArrowLeft)) {
-                return PreviewAction::Close;
-            }
-            if ctx.input(|input| input.key_pressed(Key::Enter)) {
-                return PreviewAction::Paste;
-            }
+            let mut result = PreviewAction::None;
 
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE.fill(Color32::TRANSPARENT).inner_margin(0))
@@ -1842,7 +1954,40 @@ impl BetterClipboardApp {
                     }
                 });
 
-            PreviewAction::None
+            let close_clicked = egui::Area::new(egui::Id::new("preview_close"))
+                .fixed_pos(egui::pos2(image_size.x - 82.0, 10.0))
+                .show(ctx, |ui| {
+                    let (rect, response) =
+                        ui.allocate_exact_size(egui::vec2(74.0, 26.0), egui::Sense::click());
+                    let bg = if response.hovered() {
+                        Color32::from_rgba_unmultiplied(50, 50, 50, 220)
+                    } else {
+                        Color32::from_rgba_unmultiplied(20, 20, 20, 180)
+                    };
+                    ui.painter().rect_filled(rect, CornerRadius::same(5), bg);
+                    ui.painter().text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "✕  Esc",
+                        egui::FontId::proportional(11.0),
+                        Color32::WHITE,
+                    );
+                    response.clicked()
+                })
+                .inner;
+
+            if close_clicked
+                || ctx.input(|input| input.viewport().close_requested())
+                || ctx.input(|input| input.key_pressed(Key::Escape))
+                || ctx.input(|input| input.key_pressed(Key::ArrowLeft))
+            {
+                result = PreviewAction::Close;
+            }
+            if ctx.input(|input| input.key_pressed(Key::Enter)) {
+                result = PreviewAction::Paste;
+            }
+
+            result
         });
 
         match action {
@@ -2177,7 +2322,10 @@ fn show_row_action_button(
         egui::pos2(rect.center().x, rect.bottom() - 7.0),
         egui::Align2::CENTER_CENTER,
         shortcut,
-        egui::FontId::proportional(8.5),
+        egui::FontId {
+            size: 8.5,
+            ..Default::default()
+        },
         muted_text(theme),
     );
     response.on_hover_text(hover_text)
@@ -3100,13 +3248,17 @@ fn mask_api_token(token: &str, sensitive_context: bool) -> Option<String> {
     if let Some(prefix) = PREFIXES
         .iter()
         .copied()
-        .find(|prefix| token.starts_with(prefix) && token.len() >= prefix.len() + 8)
+        .find(|prefix| token.starts_with(prefix) && token.len() >= prefix.len() + 4)
     {
         return Some(format!("{prefix}...{}", last_chars(token, 4)));
     }
 
     if sensitive_context && looks_like_secret_value(token) {
         return Some(format!("••••{}", last_chars(token, 4)));
+    }
+
+    if token.len() >= 20 && looks_like_secret_value(token) {
+        return Some(format!("{}...{}", &token[..4], last_chars(token, 4)));
     }
 
     None
@@ -3138,7 +3290,7 @@ fn sensitive_context_before(text: &str, start: usize) -> bool {
 }
 
 fn looks_like_secret_value(token: &str) -> bool {
-    if token.len() < 32 {
+    if token.len() < 20 {
         return false;
     }
 
