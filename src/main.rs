@@ -1733,41 +1733,6 @@ paint_row_summary(
                                                 );
                                             },
                                         );
-                                        ui.allocate_ui_with_layout(
-                                            egui::vec2(content_width, HINT_CHIP_HEIGHT),
-                                            egui::Layout::left_to_right(egui::Align::Center),
-                                            |ui| {
-                                                let actions_width =
-                                                    row_action_buttons_width(item.kind);
-                                                let metadata_width =
-                                                    (content_width - actions_width - 10.0).max(0.0);
-                                                ui.add_sized(
-                                                    egui::vec2(metadata_width, HINT_CHIP_HEIGHT),
-                                                    egui::Label::new(
-                                                        RichText::new(format!(
-                                                            "{} · {}",
-                                                            item.kind.label(),
-                                                            item.created_at.format("%H:%M:%S")
-                                                        ))
-                                                        .color(muted),
-                                                    )
-                                                    .truncate()
-                                                    .halign(egui::Align::Min),
-                                                );
-                                                ui.with_layout(
-                                                    egui::Layout::right_to_left(
-                                                        egui::Align::Center,
-                                                    ),
-                                                    |ui| {
-                                                        row_action = show_row_action_buttons(
-                                                            ui,
-                                                            item.kind,
-                                                            self.settings.theme,
-                                                        );
-                                                    },
-                                                );
-                                            },
-                                        );
                                     },
                                 );
                             });
