@@ -732,6 +732,7 @@ struct BetterClipboardApp {
     last_repaint: Instant,
     search_active: bool,
     search_query: String,
+    search_focus_requested: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -788,6 +789,7 @@ impl BetterClipboardApp {
             last_repaint: Instant::now(),
             search_active: false,
             search_query: String::new(),
+            search_focus_requested: false,
         }
     }
 
@@ -861,6 +863,7 @@ impl BetterClipboardApp {
         self.focus_loss_started = None;
         self.search_active = false;
         self.search_query.clear();
+        self.search_focus_requested = false;
         self.close_image_preview(ctx);
         self.close_share_picker();
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
@@ -1284,10 +1287,6 @@ impl BetterClipboardApp {
         let escape = ctx.input(|input| input.key_pressed(Key::Escape));
         let right = ctx.input(|input| input.key_pressed(Key::ArrowRight));
         let left = ctx.input(|input| input.key_pressed(Key::ArrowLeft));
-        let open = ctx.input(|input| input.key_pressed(Key::O));
-        let copy = ctx.input(|input| input.key_pressed(Key::C));
-        let finder = ctx.input(|input| input.key_pressed(Key::F));
-        let share = ctx.input(|input| input.key_pressed(Key::S));
 
         if self.preview_item.is_some() {
             if right {
@@ -1302,7 +1301,7 @@ impl BetterClipboardApp {
                     self.copy_and_paste_item(&visible_items[index], data_dir, ctx);
                 }
             }
-            if copy {
+            if ctx.input(|input| input.key_pressed(Key::C)) {
                 if let Some(index) = self.selected_index(visible_items) {
                     let item = &visible_items[index];
                     self.copy_item_and_hide(
@@ -1313,7 +1312,7 @@ impl BetterClipboardApp {
                     );
                 }
             }
-            if share {
+            if ctx.input(|input| input.key_pressed(Key::S)) {
                 if let Some(index) = self.selected_index(visible_items) {
                     let item = &visible_items[index];
                     self.close_image_preview(ctx);
@@ -1330,6 +1329,7 @@ impl BetterClipboardApp {
             } else {
                 self.search_active = false;
                 self.search_query.clear();
+                self.search_focus_requested = false;
                 self.hide_window(ctx);
             }
             return;
@@ -1339,11 +1339,30 @@ impl BetterClipboardApp {
             return;
         }
 
-        // / opens search; if already active it re-focuses (handled by the UI)
+        // While search is active: only navigate (↑↓ Enter) — all letter keys feed the text field.
+        if self.search_active {
+            if down {
+                self.move_selection(visible_items, 1);
+                self.scroll_selected_into_view = true;
+            }
+            if up {
+                self.move_selection(visible_items, -1);
+                self.scroll_selected_into_view = true;
+            }
+            if enter {
+                if let Some(index) = self.selected_index(visible_items) {
+                    self.copy_and_paste_item(&visible_items[index], data_dir, ctx);
+                }
+            }
+            return;
+        }
+
+        // / opens search
         let slash = ctx.input(|input| input.key_pressed(Key::Slash));
-        if slash && !self.search_active {
+        if slash {
             self.search_active = true;
             self.search_query.clear();
+            self.search_focus_requested = true;
             self.select_first_on_show = true;
             self.set_expanded(true, ctx);
             return;
@@ -1372,12 +1391,12 @@ impl BetterClipboardApp {
                 self.open_image_preview(&visible_items[index], ctx);
             }
         }
-        if open {
+        if ctx.input(|input| input.key_pressed(Key::O)) {
             if let Some(index) = self.selected_index(visible_items) {
                 self.open_item(&visible_items[index], data_dir, ctx);
             }
         }
-        if copy {
+        if ctx.input(|input| input.key_pressed(Key::C)) {
             if let Some(index) = self.selected_index(visible_items) {
                 let item = &visible_items[index];
                 self.copy_item_and_hide(
@@ -1388,7 +1407,7 @@ impl BetterClipboardApp {
                 );
             }
         }
-        if finder {
+        if ctx.input(|input| input.key_pressed(Key::F)) {
             if let Some(index) = self.selected_index(visible_items) {
                 if matches!(
                     visible_items[index].kind,
@@ -1398,7 +1417,7 @@ impl BetterClipboardApp {
                 }
             }
         }
-        if share {
+        if ctx.input(|input| input.key_pressed(Key::S)) {
             if let Some(index) = self.selected_index(visible_items) {
                 self.share_item(&visible_items[index], data_dir);
             }
@@ -1681,22 +1700,57 @@ impl eframe::App for BetterClipboardApp {
                             .desired_width(f32::INFINITY)
                             .frame(false);
                         let response = ui.add(search_field);
-                        // Auto-focus on first frame when search is activated
-                        response.request_focus();
+                        // Request focus only on the first frame after search is activated
+                        if self.search_focus_requested {
+                            response.request_focus();
+                            self.search_focus_requested = false;
+                        }
                         if response.changed() {
                             self.select_first_on_show = true;
                         }
                         if !self.search_query.is_empty()
                             && ui
                                 .small_button(RichText::new("×").color(muted))
-                                .on_hover_text("Clear search")
+                                .on_hover_text("Clear search (Esc)")
                                 .clicked()
                         {
                             self.search_query.clear();
                             self.select_first_on_show = true;
                         }
                     });
-                    ui.add(egui::Separator::default().spacing(6.0));
+                    // Shortcut hint strip
+                    ui.horizontal(|ui| {
+                        ui.add_space(2.0);
+                        for (key, desc) in [
+                            ("↑↓", "navigate"),
+                            ("Enter", "paste"),
+                            ("Esc", "clear / close"),
+                        ] {
+                            ui.label(
+                                RichText::new(key)
+                                    .strong()
+                                    .size(10.0)
+                                    .color(muted),
+                            );
+                            ui.label(
+                                RichText::new(desc)
+                                    .size(10.0)
+                                    .color(muted),
+                            );
+                            ui.label(RichText::new("·").size(10.0).color(muted));
+                        }
+                    });
+                    ui.add(egui::Separator::default().spacing(4.0));
+                } else {
+                    // / search hint shown in footer when palette is idle
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            RichText::new("/ to search")
+                                .size(10.0)
+                                .color(muted),
+                        );
+                    });
+                    ui.add_space(2.0);
                 }
 
                 if visible_items.is_empty() {
