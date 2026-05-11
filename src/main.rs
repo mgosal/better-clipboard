@@ -37,9 +37,8 @@ use objc2::{
     runtime::{AnyObject, ProtocolObject},
 };
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationOptions, NSBitmapImageRep, NSImage, NSPasteboard,
-    NSPasteboardType, NSPasteboardTypeFileURL, NSPasteboardWriting, NSRunningApplication,
-    NSSharingServicePicker, NSWorkspace,
+    NSApplication, NSApplicationActivationOptions, NSPasteboard, NSPasteboardTypeFileURL,
+    NSPasteboardWriting, NSRunningApplication, NSSharingServicePicker, NSWorkspace,
 };
 use objc2_foundation::{NSArray, NSPoint, NSRect, NSRectEdge, NSSize, NSString, NSURL};
 use serde::{Deserialize, Serialize};
@@ -292,8 +291,21 @@ fn read_clipboard(clipboard: &mut Clipboard) -> Option<ClipboardSnapshot> {
         });
     }
 
-    if let Some(image_data) = read_image_from_pasteboard() {
-        return Some(image_data);
+    // Check image before text: Safari (and other browsers) place both image data
+    // and a text URL on the pasteboard when copying an image. Checking image first
+    // ensures we capture the actual image rather than the URL text.
+    if let Ok(image) = clipboard.get_image() {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"image:");
+        hasher.update(&(image.width as u64).to_le_bytes());
+        hasher.update(&(image.height as u64).to_le_bytes());
+        hasher.update(&image.bytes);
+        return Some(ClipboardSnapshot::Image {
+            width: image.width,
+            height: image.height,
+            rgba: image.bytes.into_owned(),
+            hash: hasher.finalize().to_hex().to_string(),
+        });
     }
 
     if let Ok(text) = clipboard.get_text() {
@@ -309,52 +321,7 @@ fn read_clipboard(clipboard: &mut Clipboard) -> Option<ClipboardSnapshot> {
         }
     }
 
-    if let Ok(image) = clipboard.get_image() {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(b"image:");
-        hasher.update(&(image.width as u64).to_le_bytes());
-        hasher.update(&(image.height as u64).to_le_bytes());
-        hasher.update(&image.bytes);
-        return Some(ClipboardSnapshot::Image {
-            width: image.width,
-            height: image.height,
-            rgba: image.bytes.into_owned(),
-            hash: hasher.finalize().to_hex().to_string(),
-        });
-    }
-
     None
-}
-
-fn read_image_from_pasteboard() -> Option<ClipboardSnapshot> {
-    let pasteboard = NSPasteboard::generalPasteboard();
-
-    let tiff_data = pasteboard.dataForType(unsafe { NSPasteboardType::tiff() })?;
-    let ns_image = NSImage::from_data(&tiff_data)?;
-    let rep = ns_image.representations().first()?;
-    let size = rep.pixelsWide() * rep.bitsPerPixel() / 8;
-    let width = rep.pixelsWide() as usize;
-    let height = rep.pixelsHigh() as usize;
-
-    if width == 0 || height == 0 {
-        return None;
-    }
-
-    let bitmap = rep.bitmapImageData()?;
-    let bytes = bitmap.bytes();
-    let rgba: Vec<u8> = bytes.iter().copied().collect();
-
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"image:");
-    hasher.update(&(width as u64).to_le_bytes());
-    hasher.update(&(height as u64).to_le_bytes());
-    hasher.update(&rgba);
-    Some(ClipboardSnapshot::Image {
-        width,
-        height,
-        rgba,
-        hash: hasher.finalize().to_hex().to_string(),
-    })
 }
 
 fn read_file_paths_from_pasteboard() -> Option<Vec<PathBuf>> {
