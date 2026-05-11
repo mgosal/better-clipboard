@@ -730,6 +730,8 @@ struct BetterClipboardApp {
     focus_loss_started: Option<Instant>,
     scroll_selected_into_view: bool,
     last_repaint: Instant,
+    search_active: bool,
+    search_query: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -784,6 +786,8 @@ impl BetterClipboardApp {
             focus_loss_started: None,
             scroll_selected_into_view: false,
             last_repaint: Instant::now(),
+            search_active: false,
+            search_query: String::new(),
         }
     }
 
@@ -855,6 +859,8 @@ impl BetterClipboardApp {
         self.settings_open = false;
         self.permission_onboarding = false;
         self.focus_loss_started = None;
+        self.search_active = false;
+        self.search_query.clear();
         self.close_image_preview(ctx);
         self.close_share_picker();
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
@@ -1318,11 +1324,28 @@ impl BetterClipboardApp {
         }
 
         if escape {
-            self.hide_window(ctx);
+            if self.search_active && !self.search_query.is_empty() {
+                self.search_query.clear();
+                self.select_first_on_show = true;
+            } else {
+                self.search_active = false;
+                self.search_query.clear();
+                self.hide_window(ctx);
+            }
             return;
         }
 
         if self.settings_open {
+            return;
+        }
+
+        // / opens search; if already active it re-focuses (handled by the UI)
+        let slash = ctx.input(|input| input.key_pressed(Key::Slash));
+        if slash && !self.search_active {
+            self.search_active = true;
+            self.search_query.clear();
+            self.select_first_on_show = true;
+            self.set_expanded(true, ctx);
             return;
         }
 
@@ -1573,7 +1596,16 @@ impl eframe::App for BetterClipboardApp {
             }
         };
 
-        let visible_items = items.clone();
+        let all_items = items.clone();
+        let visible_items: Vec<ClipItem> = if self.search_active && !self.search_query.is_empty() {
+            let query = self.search_query.to_lowercase();
+            all_items
+                .into_iter()
+                .filter(|item| item.summary.to_lowercase().contains(&query))
+                .collect()
+        } else {
+            all_items
+        };
         self.ensure_selection(&visible_items);
         self.handle_keyboard(ctx, &visible_items, &data_dir);
         self.handle_scroll_intent(ctx, visible_items.len());
@@ -1601,7 +1633,9 @@ impl eframe::App for BetterClipboardApp {
                     ui.label(RichText::new("📋").size(22.0));
                     ui.label(RichText::new(APP_NAME).strong().size(18.0));
                     ui.separator();
-                    let count_text = if self.palette_expanded {
+                    let count_text = if self.search_active && !self.search_query.is_empty() {
+                        format!("{} match{}", visible_items.len(), if visible_items.len() == 1 { "" } else { "es" })
+                    } else if self.palette_expanded {
                         format!("{} items", visible_items.len())
                     } else if visible_items.is_empty() {
                         "0 items".to_owned()
@@ -1638,9 +1672,40 @@ impl eframe::App for BetterClipboardApp {
                     return;
                 }
 
+                // Search bar — shown when / has been pressed
+                if self.search_active {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("🔍").size(13.0).color(muted));
+                        let search_field = egui::TextEdit::singleline(&mut self.search_query)
+                            .hint_text("Search history…")
+                            .desired_width(f32::INFINITY)
+                            .frame(false);
+                        let response = ui.add(search_field);
+                        // Auto-focus on first frame when search is activated
+                        response.request_focus();
+                        if response.changed() {
+                            self.select_first_on_show = true;
+                        }
+                        if !self.search_query.is_empty()
+                            && ui
+                                .small_button(RichText::new("×").color(muted))
+                                .on_hover_text("Clear search")
+                                .clicked()
+                        {
+                            self.search_query.clear();
+                            self.select_first_on_show = true;
+                        }
+                    });
+                    ui.add(egui::Separator::default().spacing(6.0));
+                }
+
                 if visible_items.is_empty() {
                     ui.centered_and_justified(|ui| {
-                        ui.label("Copy text, a URL, or an image to start building history.");
+                        if self.search_active && !self.search_query.is_empty() {
+                            ui.label(format!("No matches for \"{}\"", self.search_query));
+                        } else {
+                            ui.label("Copy text, a URL, or an image to start building history.");
+                        }
                     });
                     return;
                 }
