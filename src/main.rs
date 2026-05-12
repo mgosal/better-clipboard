@@ -140,27 +140,14 @@ fn main() -> eframe::Result<()> {
 fn register_shortcut() -> Result<ShortcutState> {
     let manager = GlobalHotKeyManager::new().context("create global shortcut manager")?;
     let option_space = HotKey::new(Some(Modifiers::ALT), Code::Space);
-    let command_option_space = HotKey::new(Some(Modifiers::SUPER | Modifiers::ALT), Code::Space);
-    let command_option_backslash =
-        HotKey::new(Some(Modifiers::SUPER | Modifiers::ALT), Code::Backslash);
 
     manager
         .register(option_space)
         .context("register Option+Space shortcut")?;
-    manager
-        .register(command_option_space)
-        .context("register Cmd+Option+Space shortcut")?;
-    manager
-        .register(command_option_backslash)
-        .context("register Cmd+Option+Backslash shortcut")?;
 
     Ok(ShortcutState {
         _manager: manager,
-        hotkey_ids: vec![
-            option_space.id(),
-            command_option_space.id(),
-            command_option_backslash.id(),
-        ],
+        hotkey_ids: vec![option_space.id()],
     })
 }
 
@@ -1357,12 +1344,16 @@ impl BetterClipboardApp {
             return;
         }
 
-        // / opens search
+        // / opens search — consume the Text("/") event so it does not leak
+        // into the search field when focus is requested on the same frame.
         let slash = ctx.input(|input| {
             input.key_pressed(Key::Slash)
                 || input.events.iter().any(|e| matches!(e, egui::Event::Text(t) if t == "/"))
         });
         if slash {
+            ctx.input_mut(|input| {
+                input.events.retain(|e| !matches!(e, egui::Event::Text(t) if t == "/"));
+            });
             self.search_active = true;
             self.search_query.clear();
             self.search_focus_requested = true;
@@ -1623,7 +1614,13 @@ impl eframe::App for BetterClipboardApp {
             let query = self.search_query.to_lowercase();
             all_items
                 .into_iter()
-                .filter(|item| item.summary.to_lowercase().contains(&query))
+                .filter(|item| {
+                    item.summary.to_lowercase().contains(&query)
+                        || item
+                            .text
+                            .as_deref()
+                            .is_some_and(|t| t.to_lowercase().contains(&query))
+                })
                 .collect()
         } else {
             all_items

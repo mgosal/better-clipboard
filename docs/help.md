@@ -1,6 +1,6 @@
 # Better Clipboard Help
 
-Better Clipboard is a macOS clipboard history palette. It keeps recent text, URLs, file paths, file-list clipboard entries, email addresses, phone numbers, and images available from the menu bar and from global shortcuts.
+Better Clipboard is a macOS clipboard history palette. It keeps recent text, URLs, file paths, file-list clipboard entries, email addresses, phone numbers, and images available from the menu bar and from a global shortcut.
 
 ## Current Status
 
@@ -36,11 +36,10 @@ Each row also includes bottom-right action buttons for the selected item's usefu
 | Shortcut | Action |
 | --- | --- |
 | `Option+Space` | Open the palette. If it is already open, cancel it. |
-| `Cmd+Option+Space` | Open the palette. If it is already open, cancel it. |
-| `Cmd+Option+\` | Open the palette. If it is already open, cancel it. |
+| `/` | Open the search bar to filter clipboard history. |
 | `Enter` | Paste the selected history item into the previously focused app. |
 | `Double-click` | Paste the clicked history item into the previously focused app. |
-| `Escape` | Close the palette without copying or pasting. |
+| `Escape` | Clear search query, or close the palette if search is empty. |
 | `Up` / `Down` | Expand the list and move the selected item. |
 | `Right Arrow` | Open a centered image preview for the selected image item. |
 | `Left Arrow` | Close the image preview. |
@@ -51,6 +50,20 @@ Each row also includes bottom-right action buttons for the selected item's usefu
 | `Cmd+Down` | Expand the list. |
 | `Tab` | Expand the list. |
 | `Cmd+Up` | Collapse the list. |
+
+## Search
+
+Press `/` while the palette is open to activate the search bar. The palette expands automatically and the search field receives focus.
+
+Type to filter clipboard history. Search matches against both the display summary and the raw clipboard text, so URLs, code snippets, and other content that may be truncated or masked in the summary row are still findable.
+
+While search is active:
+
+- `Up` / `Down` navigate through the filtered results.
+- `Enter` pastes the selected match into the previously focused app.
+- `Escape` clears the search query. Press `Escape` again (or when the query is already empty) to close the palette.
+
+A `/ to search` hint is shown in the top-right corner of the palette when search is not active.
 
 ## Palette
 

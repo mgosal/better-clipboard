@@ -2,7 +2,7 @@
 
 Better Clipboard is a small macOS clipboard history app written in Rust.
 
-It watches `NSPasteboard.changeCount` and only reads clipboard contents when macOS reports a change. Text, URLs, file paths, file-list clipboard entries, email addresses, phone numbers, and images are stored locally, and the palette can be opened with `Option+Space`, `Cmd+Option+Space`, `Cmd+Option+\`, or from the 📋 menu bar icon.
+It watches `NSPasteboard.changeCount` and only reads clipboard contents when macOS reports a change. Text, URLs, file paths, file-list clipboard entries, email addresses, phone numbers, and images are stored locally, and the palette can be opened with `Option+Space` or from the 📋 menu bar icon.
 
 ## Install
 
@@ -31,11 +31,10 @@ macOS does not expose an event queue of past clipboard contents, so very rapid c
 ## Shortcuts
 
 - `Option+Space`: open the palette; press again to cancel.
-- `Cmd+Option+Space`: open the palette; press again to cancel.
-- `Cmd+Option+\`: open the palette; press again to cancel.
+- `/`: open the search bar to filter clipboard history.
 - `Enter`: paste the selected item into the previously focused app.
 - `Double-click`: paste that item into the previously focused app.
-- `Escape`: cancel without changing the clipboard.
+- `Escape`: clear the search query, or close the palette if search is empty.
 - `Up` / `Down`: expand the list and move selection.
 - `Right Arrow`: preview the selected image item.
 - `Left Arrow`: close the image preview.
@@ -45,6 +44,12 @@ macOS does not expose an event queue of past clipboard contents, so very rapid c
 - `S`: open the macOS share sheet for the selected item.
 - `Cmd+Down` or `Tab`: expand the list.
 - `Cmd+Up`: collapse the list.
+
+## Search
+
+Press `/` while the palette is open to activate the search bar. Type to filter clipboard history by content — search matches against both the display summary and the raw clipboard text, so URLs, code, and other content truncated in the summary are still findable.
+
+While search is active, `Up`/`Down` navigate the filtered results and `Enter` pastes the selected match. Press `Escape` to clear the query; press `Escape` again to close the palette.
 
 See [docs/help.md](docs/help.md) for a fuller operating guide, [docs/manual-test-script.md](docs/manual-test-script.md) for release testing, and [docs/release-plan.md](docs/release-plan.md) for the current v1 tagging recommendation.
 

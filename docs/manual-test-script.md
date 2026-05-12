@@ -1,6 +1,6 @@
 # Manual Test Script
 
-Use this script for release testing before filing issues. The current release candidate should cover the core keyboard workflow, native Share, file-list capture, the compact-to-expanded scroll behavior, image capture, sensitive value masking, and image preview.
+Use this script for release testing before filing issues. The current release candidate should cover the core keyboard workflow, native Share, file-list capture, the compact-to-expanded scroll behavior, image capture, sensitive value masking, image preview, and search.
 
 ## Current Known Issues
 
@@ -70,6 +70,24 @@ Use this script for release testing before filing issues. The current release ca
 - [ ] Press `Cmd+Down` or `Tab` to expand the list.
 - [ ] Press `Cmd+Up` to collapse the list.
 - [ ] Press `Escape` and confirm the palette closes without changing the clipboard.
+
+## Search
+
+- [ ] Open Better Clipboard with `Option+Space`.
+- [ ] Press `/` to activate search.
+- [ ] Confirm the palette expands, a search bar appears with focus, and the `/` character does not appear in the search field.
+- [ ] Type a query that matches a known clipboard item.
+- [ ] Confirm matching items are shown and non-matching items are hidden.
+- [ ] Confirm search matches against both the summary text and the raw clipboard content (e.g. a URL that was truncated in the summary).
+- [ ] Press `Down` and `Up` to navigate filtered results.
+- [ ] Press `Enter` to paste the selected filtered item into the previous app.
+- [ ] Reopen and activate search again.
+- [ ] Type a query, then press `Escape`.
+- [ ] Confirm the search query clears but the palette stays open.
+- [ ] Press `Escape` again.
+- [ ] Confirm the palette closes.
+- [ ] Reopen, activate search, type a query with no matches.
+- [ ] Confirm a "No matches" message appears.
 
 ## Paste Flow
 
