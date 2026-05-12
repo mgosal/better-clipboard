@@ -1,6 +1,6 @@
 [package]
 name = "better-clipboard"
-version = "0.1.0"
+version = "0.2.3"
 edition = "2024"
 description = "A small macOS clipboard history palette written in Rust."
 readme = "README.md"
