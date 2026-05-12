@@ -909,10 +909,17 @@ impl BetterClipboardApp {
     }
 
     fn copy_item(&mut self, item: &ClipItem, data_dir: &Path) -> bool {
+        // Suppress the hash before writing so the watcher thread won't race
+        // and create a duplicate entry with a new UUID/timestamp.
+        if let Ok(mut store) = self.store.lock() {
+            store.suppress_next_hash(&item.hash);
+        }
+
         match copy_item_to_clipboard(item, data_dir) {
             Ok(()) => {
                 let mut status = format!("Copied {}", item.kind.label().to_lowercase());
                 if let Ok(mut store) = self.store.lock() {
+                    store.allow_hash(&item.hash);
                     if let Err(err) = store.promote(item.id) {
                         status = format!("Copied; history update failed: {err:#}");
                     }
@@ -922,6 +929,9 @@ impl BetterClipboardApp {
                 true
             }
             Err(err) => {
+                if let Ok(mut store) = self.store.lock() {
+                    store.allow_hash(&item.hash);
+                }
                 self.status = format!("Copy failed: {err:#}");
                 false
             }
