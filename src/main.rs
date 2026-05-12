@@ -1358,7 +1358,10 @@ impl BetterClipboardApp {
         }
 
         // / opens search
-        let slash = ctx.input(|input| input.key_pressed(Key::Slash));
+        let slash = ctx.input(|input| {
+            input.key_pressed(Key::Slash)
+                || input.events.iter().any(|e| matches!(e, egui::Event::Text(t) if t == "/"))
+        });
         if slash {
             self.search_active = true;
             self.search_query.clear();
