@@ -223,19 +223,17 @@ fn start_clipboard_watcher(store: Arc<Mutex<HistoryStore>>) {
         let mut last_hash = String::new();
 
         loop {
-            if monitor.should_read_clipboard() {
-                if let Some(snapshot) = read_clipboard(&mut clipboard) {
+            if monitor.should_read_clipboard()
+                && let Some(snapshot) = read_clipboard(&mut clipboard) {
                     let snapshot_hash = snapshot.hash().to_owned();
                     if snapshot_hash != last_hash {
                         last_hash = snapshot_hash;
-                        if let Ok(mut store) = store.lock() {
-                            if let Err(err) = store.push(snapshot) {
+                        if let Ok(mut store) = store.lock()
+                            && let Err(err) = store.push(snapshot) {
                                 eprintln!("Could not save clipboard item: {err:#}");
                             }
-                        }
                     }
                 }
-            }
             thread::sleep(CHANGE_COUNT_CHECK_INTERVAL);
         }
     });
@@ -317,21 +315,18 @@ fn read_file_paths_from_pasteboard() -> Option<Vec<PathBuf>> {
 
     if let Some(items) = pasteboard.pasteboardItems() {
         for item in items.iter() {
-            if let Some(value) = item.stringForType(unsafe { NSPasteboardTypeFileURL }) {
-                if let Some(path) = file_path_from_file_url_string(&value.to_string()) {
+            if let Some(value) = item.stringForType(unsafe { NSPasteboardTypeFileURL })
+                && let Some(path) = file_path_from_file_url_string(&value.to_string()) {
                     paths.push(path);
                 }
-            }
         }
     }
 
-    if paths.is_empty() {
-        if let Some(value) = pasteboard.stringForType(unsafe { NSPasteboardTypeFileURL }) {
-            if let Some(path) = file_path_from_file_url_string(&value.to_string()) {
+    if paths.is_empty()
+        && let Some(value) = pasteboard.stringForType(unsafe { NSPasteboardTypeFileURL })
+            && let Some(path) = file_path_from_file_url_string(&value.to_string()) {
                 paths.push(path);
             }
-        }
-    }
 
     paths.dedup();
     (!paths.is_empty()).then_some(paths)
@@ -423,16 +418,13 @@ impl AppSettings {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default)]
 enum ThemeMode {
     Light,
+    #[default]
     Dark,
 }
 
-impl Default for ThemeMode {
-    fn default() -> Self {
-        Self::Dark
-    }
-}
 
 impl ThemeMode {
     fn label(self) -> &'static str {
@@ -480,17 +472,22 @@ impl HistoryStore {
         let bytes = fs::read(&history_path).context("read history file")?;
         let mut items: Vec<ClipItem> =
             serde_json::from_slice(&bytes).context("parse history file")?;
-        items.truncate(max_items);
-        let changed = items.iter_mut().fold(false, |changed, item| {
-            normalize_loaded_item(item) || changed
-        });
-        let store = Self {
+        let mut changed = false;
+        for item in &mut items {
+            // Not `any()`: normalization must run for every item, no short-circuit.
+            changed |= normalize_loaded_item(item);
+        }
+        let mut store = Self {
             data_dir,
             max_items,
             items,
             suppressed_hashes: Vec::new(),
         };
-        if changed {
+        // Enforce the limit through prune_to_limit so image files of dropped
+        // entries are deleted instead of leaking in the images directory.
+        let pruned = store.items.len() > store.max_items;
+        store.prune_to_limit();
+        if changed || pruned {
             store.save().context("save normalized history")?;
         }
         Ok(store)
@@ -510,7 +507,17 @@ impl HistoryStore {
             return Ok(());
         }
 
-        self.items.retain(|item| item.hash != hash);
+        let mut kept = Vec::with_capacity(self.items.len());
+        for existing in self.items.drain(..) {
+            if existing.hash == hash {
+                if let Some(image) = existing.image {
+                    let _ = fs::remove_file(self.data_dir.join(image.path));
+                }
+            } else {
+                kept.push(existing);
+            }
+        }
+        self.items = kept;
         let item = match snapshot {
             ClipboardSnapshot::Text { text, hash } => ClipItem::from_text(text, hash),
             ClipboardSnapshot::Files { paths, hash } => ClipItem::from_files(paths, hash),
@@ -882,11 +889,10 @@ impl BetterClipboardApp {
     fn set_history_limit(&mut self, limit: usize) {
         let limit = limit.clamp(MIN_HISTORY_LIMIT, MAX_HISTORY_LIMIT);
         self.settings.history_limit = limit;
-        if let Ok(mut store) = self.store.lock() {
-            if let Err(err) = store.set_max_items(limit) {
+        if let Ok(mut store) = self.store.lock()
+            && let Err(err) = store.set_max_items(limit) {
                 self.status = format!("History prune failed: {err:#}");
             }
-        }
         self.save_settings();
     }
 
@@ -1293,13 +1299,12 @@ impl BetterClipboardApp {
                 self.close_image_preview(ctx);
                 return;
             }
-            if enter {
-                if let Some(index) = self.selected_index(visible_items) {
+            if enter
+                && let Some(index) = self.selected_index(visible_items) {
                     self.copy_and_paste_item(&visible_items[index], data_dir, ctx);
                 }
-            }
-            if ctx.input(|input| input.key_pressed(Key::C)) {
-                if let Some(index) = self.selected_index(visible_items) {
+            if ctx.input(|input| input.key_pressed(Key::C))
+                && let Some(index) = self.selected_index(visible_items) {
                     let item = &visible_items[index];
                     self.copy_item_and_hide(
                         item,
@@ -1308,14 +1313,12 @@ impl BetterClipboardApp {
                         &format!("Copied {}", item.kind.label().to_lowercase()),
                     );
                 }
-            }
-            if ctx.input(|input| input.key_pressed(Key::S)) {
-                if let Some(index) = self.selected_index(visible_items) {
+            if ctx.input(|input| input.key_pressed(Key::S))
+                && let Some(index) = self.selected_index(visible_items) {
                     let item = &visible_items[index];
                     self.close_image_preview(ctx);
                     self.share_item(item, data_dir);
                 }
-            }
             return;
         }
 
@@ -1346,11 +1349,10 @@ impl BetterClipboardApp {
                 self.move_selection(visible_items, -1);
                 self.scroll_selected_into_view = true;
             }
-            if enter {
-                if let Some(index) = self.selected_index(visible_items) {
+            if enter
+                && let Some(index) = self.selected_index(visible_items) {
                     self.copy_and_paste_item(&visible_items[index], data_dir, ctx);
                 }
-            }
             return;
         }
 
@@ -1390,18 +1392,16 @@ impl BetterClipboardApp {
             self.set_expanded(true, ctx);
             self.move_selection(visible_items, -1);
         }
-        if right {
-            if let Some(index) = self.selected_index(visible_items) {
+        if right
+            && let Some(index) = self.selected_index(visible_items) {
                 self.open_image_preview(&visible_items[index], ctx);
             }
-        }
-        if ctx.input(|input| input.key_pressed(Key::O)) {
-            if let Some(index) = self.selected_index(visible_items) {
+        if ctx.input(|input| input.key_pressed(Key::O))
+            && let Some(index) = self.selected_index(visible_items) {
                 self.open_item(&visible_items[index], data_dir, ctx);
             }
-        }
-        if ctx.input(|input| input.key_pressed(Key::C)) {
-            if let Some(index) = self.selected_index(visible_items) {
+        if ctx.input(|input| input.key_pressed(Key::C))
+            && let Some(index) = self.selected_index(visible_items) {
                 let item = &visible_items[index];
                 self.copy_item_and_hide(
                     item,
@@ -1410,27 +1410,22 @@ impl BetterClipboardApp {
                     &format!("Copied {}", item.kind.label().to_lowercase()),
                 );
             }
-        }
-        if ctx.input(|input| input.key_pressed(Key::F)) {
-            if let Some(index) = self.selected_index(visible_items) {
-                if matches!(
+        if ctx.input(|input| input.key_pressed(Key::F))
+            && let Some(index) = self.selected_index(visible_items)
+                && matches!(
                     visible_items[index].kind,
                     ClipKind::FilePath | ClipKind::Files
                 ) {
                     self.reveal_file_in_finder(&visible_items[index], ctx);
                 }
-            }
-        }
-        if ctx.input(|input| input.key_pressed(Key::S)) {
-            if let Some(index) = self.selected_index(visible_items) {
+        if ctx.input(|input| input.key_pressed(Key::S))
+            && let Some(index) = self.selected_index(visible_items) {
                 self.share_item(&visible_items[index], data_dir);
             }
-        }
-        if enter {
-            if let Some(index) = self.selected_index(visible_items) {
+        if enter
+            && let Some(index) = self.selected_index(visible_items) {
                 self.copy_and_paste_item(&visible_items[index], data_dir, ctx);
             }
-        }
     }
 
     fn handle_scroll_intent(&mut self, ctx: &egui::Context, item_count: usize) {
@@ -1619,10 +1614,9 @@ impl eframe::App for BetterClipboardApp {
             }
         };
 
-        let all_items = items.clone();
         let visible_items: Vec<ClipItem> = if self.search_active && !self.search_query.is_empty() {
             let query = self.search_query.to_lowercase();
-            all_items
+            items
                 .into_iter()
                 .filter(|item| {
                     item.summary.to_lowercase().contains(&query)
@@ -1633,7 +1627,7 @@ impl eframe::App for BetterClipboardApp {
                 })
                 .collect()
         } else {
-            all_items
+            items
         };
         self.ensure_selection(&visible_items);
         self.handle_keyboard(ctx, &visible_items, &data_dir);
@@ -1928,8 +1922,8 @@ impl BetterClipboardApp {
         let image_size = preview_image_size(ctx, image.width, image.height);
         let window_size = image_size;
 
-        if !self.textures.contains_key(&item.id) {
-            if let Ok(color_image) = load_color_image(&data_dir.join(&image.path)) {
+        if !self.textures.contains_key(&item.id)
+            && let Ok(color_image) = load_color_image(&data_dir.join(&image.path)) {
                 let texture = ctx.load_texture(
                     item.id.to_string(),
                     color_image,
@@ -1937,7 +1931,6 @@ impl BetterClipboardApp {
                 );
                 self.textures.insert(item.id, texture);
             }
-        }
         let texture = self.textures.get(&item.id).cloned();
         let theme = self.settings.theme;
         let builder = image_preview_viewport_builder(ctx, window_size);
@@ -2574,8 +2567,8 @@ fn show_item_action_button(
     );
 
     if let Some(image) = &item.image {
-        if !textures.contains_key(&item.id) {
-            if let Ok(color_image) = load_color_image(&data_dir.join(&image.path)) {
+        if !textures.contains_key(&item.id)
+            && let Ok(color_image) = load_color_image(&data_dir.join(&image.path)) {
                 let texture = ctx.load_texture(
                     item.id.to_string(),
                     color_image,
@@ -2583,7 +2576,6 @@ fn show_item_action_button(
                 );
                 textures.insert(item.id, texture);
             }
-        }
 
         if let Some(texture) = textures.get(&item.id) {
             let target = image_fit_rect(rect.shrink(3.0), image.width, image.height);
@@ -2975,7 +2967,7 @@ fn classify_text(text: &str) -> ClipKind {
 
     if file_path_from_text(trimmed).is_some() {
         ClipKind::FilePath
-    } else if Url::parse(trimmed).is_ok() {
+    } else if is_probable_url(trimmed) {
         ClipKind::Url
     } else if is_email_address(trimmed) {
         ClipKind::Email
@@ -2986,18 +2978,27 @@ fn classify_text(text: &str) -> ClipKind {
     }
 }
 
+/// True for text that should get URL treatment. `Url::parse` alone accepts any
+/// `word:rest` pair ("note:remember-this" parses with scheme "note"), so also
+/// require a host or a well-known host-less scheme.
+fn is_probable_url(trimmed: &str) -> bool {
+    match Url::parse(trimmed) {
+        Ok(url) => url.has_host() || matches!(url.scheme(), "mailto" | "tel" | "sms" | "facetime"),
+        Err(_) => false,
+    }
+}
+
 fn file_path_from_text(text: &str) -> Option<PathBuf> {
     let trimmed = strip_wrapping_quotes(text.trim());
     if trimmed.is_empty() || trimmed.contains('\n') || trimmed.contains('\r') {
         return None;
     }
 
-    if let Ok(url) = Url::parse(trimmed) {
-        if url.scheme() == "file" {
+    if let Ok(url) = Url::parse(trimmed)
+        && url.scheme() == "file" {
             let path = url.to_file_path().ok()?;
             return path.exists().then_some(path);
         }
-    }
 
     let path = if trimmed == "~" {
         PathBuf::from(env::var_os("HOME")?)
@@ -3399,6 +3400,14 @@ mod tests {
         assert_eq!(classify_text("https://example.com"), ClipKind::Url);
         assert_eq!(classify_text("person@example.com"), ClipKind::Email);
         assert_eq!(classify_text("+44 20 7946 0958"), ClipKind::Phone);
+    }
+
+    #[test]
+    fn colon_separated_text_is_not_a_url() {
+        assert_eq!(classify_text("note:remember-this"), ClipKind::Text);
+        assert_eq!(classify_text("todo:refactor"), ClipKind::Text);
+        assert_eq!(classify_text("mailto:person@example.com"), ClipKind::Url);
+        assert_eq!(classify_text("http://localhost:8080/health"), ClipKind::Url);
     }
 
     #[test]
