@@ -1,0 +1,4386 @@
+#[cfg(not(target_os = "macos"))]
+compile_error!("Better Clipboard is macOS-only for now.");
+
+mod ingest;
+mod notify;
+
+use std::{
+    borrow::Cow,
+    env, fs,
+    path::{Path, PathBuf},
+    process::Command,
+    sync::{Arc, Mutex, RwLock, mpsc},
+    thread,
+    time::{Duration, Instant},
+};
+
+use anyhow::{Context, Result};
+use arboard::{Clipboard, ImageData};
+use chrono::{DateTime, Local, TimeDelta};
+use core_foundation::{
+    base::TCFType,
+    boolean::CFBoolean,
+    dictionary::{CFDictionary, CFDictionaryRef},
+    string::CFString,
+};
+use core_graphics::{
+    event::{CGEvent, CGEventFlags, CGEventTapLocation},
+    event_source::{CGEventSource, CGEventSourceStateID},
+};
+use directories::ProjectDirs;
+use eframe::egui::{self, Color32, CornerRadius, Key, RichText, Stroke, TextureHandle};
+use global_hotkey::{
+    GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState,
+    hotkey::{Code, HotKey, Modifiers},
+};
+use image::{ImageBuffer, ImageReader, Rgba};
+use ingest::{IngestKind, IngestRequest, IngestServer};
+use objc2::{
+    AnyThread, MainThreadMarker, Message,
+    rc::Retained,
+    runtime::{AnyObject, ProtocolObject},
+};
+use objc2_app_kit::{
+    NSApplication, NSApplicationActivationOptions, NSPasteboard, NSPasteboardTypeFileURL,
+    NSPasteboardWriting, NSRunningApplication, NSSharingServicePicker, NSWorkspace,
+};
+use objc2_foundation::{NSArray, NSPoint, NSRect, NSRectEdge, NSSize, NSString, NSURL};
+use serde::{Deserialize, Serialize};
+use tray_icon::{
+    TrayIcon, TrayIconBuilder,
+    menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
+};
+use url::Url;
+use uuid::Uuid;
+
+const DEFAULT_HISTORY_LIMIT: usize = 100;
+const MIN_HISTORY_LIMIT: usize = 10;
+const MAX_HISTORY_LIMIT: usize = 1_000;
+const COMPACT_VISIBLE_ITEMS: usize = 3;
+const ROW_HEIGHT: f32 = 118.0;
+const THUMBNAIL_SIZE: f32 = 74.0;
+const TEXT_PREVIEW_HEIGHT: f32 = 62.0;
+const PREVIEW_SCALE: f32 = 1.0;
+const PREVIEW_MAX_IMAGE_WIDTH: f32 = 10_000.0;
+const PREVIEW_MAX_IMAGE_HEIGHT: f32 = 10_000.0;
+const HINT_CHIP_WIDTH: f32 = 58.0;
+const HINT_CHIP_HEIGHT: f32 = 48.0;
+const HINT_CHIP_GAP: f32 = 6.0;
+const FOCUS_HIDE_GRACE: Duration = Duration::from_millis(180);
+const CHANGE_COUNT_CHECK_INTERVAL: Duration = Duration::from_millis(100);
+const PASTE_DELAY: Duration = Duration::from_millis(140);
+const PERMISSION_PROMPT_DELAY: Duration = Duration::from_millis(700);
+const COMPACT_HEIGHT: f32 = 474.0;
+const EXPANDED_HEIGHT: f32 = 720.0;
+const SETTINGS_HEIGHT: f32 = 470.0;
+const TEXT_VIEWER_SIZE: [f32; 2] = [680.0, 560.0];
+const ONE_TIME_CODE_TTL: TimeDelta = TimeDelta::minutes(10);
+const EXPIRY_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+const APP_NAME: &str = "Better Clipboard";
+const LAUNCH_AGENT_LABEL: &str = "com.mgosal.better-clipboard";
+const TRAY_SHOW_ID: &str = "better-clipboard-show";
+const TRAY_SETTINGS_ID: &str = "better-clipboard-settings";
+const TRAY_QUIT_ID: &str = "better-clipboard-quit";
+
+#[link(name = "ApplicationServices", kind = "framework")]
+unsafe extern "C" {
+    fn AXIsProcessTrusted() -> bool;
+    fn AXIsProcessTrustedWithOptions(options: CFDictionaryRef) -> bool;
+}
+
+fn main() -> eframe::Result<()> {
+    let settings = AppSettings::load().unwrap_or_else(|err| {
+        eprintln!("Could not load settings: {err:#}");
+        AppSettings::default()
+    });
+    let needs_permission_onboarding = !accessibility_permission_granted();
+
+    let store = Arc::new(Mutex::new(
+        HistoryStore::load(settings.history_limit).unwrap_or_else(|err| {
+            eprintln!("Could not load clipboard history: {err:#}");
+            HistoryStore::new(default_data_dir(), settings.history_limit)
+        }),
+    ));
+
+    start_clipboard_watcher(Arc::clone(&store));
+
+    let shortcut = register_shortcut()
+        .map_err(|err| {
+            eprintln!("Could not register global shortcut: {err:#}");
+            err
+        })
+        .ok();
+
+    let native_options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([620.0, COMPACT_HEIGHT])
+            .with_min_inner_size([620.0, 150.0])
+            .with_max_inner_size([620.0, EXPANDED_HEIGHT])
+            .with_resizable(false)
+            .with_decorations(false)
+            .with_window_level(if needs_permission_onboarding {
+                egui::WindowLevel::Normal
+            } else {
+                egui::WindowLevel::AlwaysOnTop
+            })
+            .with_visible(needs_permission_onboarding)
+            .with_title(APP_NAME),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        APP_NAME,
+        native_options,
+        Box::new(move |cc| {
+            egui_extras::install_image_loaders(&cc.egui_ctx);
+            Ok(Box::new(BetterClipboardApp::new(
+                store,
+                shortcut,
+                cc.egui_ctx.clone(),
+                settings,
+                needs_permission_onboarding,
+            )))
+        }),
+    )
+}
+
+fn register_shortcut() -> Result<ShortcutState> {
+    let manager = GlobalHotKeyManager::new().context("create global shortcut manager")?;
+    let option_space = HotKey::new(Some(Modifiers::ALT), Code::Space);
+
+    manager
+        .register(option_space)
+        .context("register Option+Space shortcut")?;
+
+    Ok(ShortcutState {
+        _manager: manager,
+        hotkey_ids: vec![option_space.id()],
+    })
+}
+
+struct ShortcutState {
+    _manager: GlobalHotKeyManager,
+    hotkey_ids: Vec<u32>,
+}
+
+struct TrayState {
+    _tray_icon: TrayIcon,
+}
+
+enum AppEvent {
+    Hotkey(u32),
+    TrayMenu(String),
+    ShowItem(Uuid),
+}
+
+fn setup_event_handlers(ctx: egui::Context) -> (mpsc::Sender<AppEvent>, mpsc::Receiver<AppEvent>) {
+    let (sender, receiver) = mpsc::channel();
+
+    let hotkey_sender = sender.clone();
+    let hotkey_ctx = ctx.clone();
+    GlobalHotKeyEvent::set_event_handler(Some(move |event: GlobalHotKeyEvent| {
+        if event.state() == HotKeyState::Pressed {
+            let _ = hotkey_sender.send(AppEvent::Hotkey(event.id()));
+            hotkey_ctx.request_repaint();
+        }
+    }));
+
+    let menu_sender = sender.clone();
+    let menu_ctx = ctx.clone();
+    MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+        let _ = menu_sender.send(AppEvent::TrayMenu(event.id().as_ref().to_owned()));
+        menu_ctx.request_repaint();
+    }));
+
+    (sender, receiver)
+}
+
+fn setup_tray_icon() -> Result<TrayState> {
+    let tray_menu = Menu::new();
+    let show_item = MenuItem::with_id(TRAY_SHOW_ID, "Show Better Clipboard", true, None);
+    let settings_item = MenuItem::with_id(TRAY_SETTINGS_ID, "Settings", true, None);
+    let quit_item = MenuItem::with_id(TRAY_QUIT_ID, "Quit Better Clipboard", true, None);
+    let separator = PredefinedMenuItem::separator();
+    tray_menu
+        .append_items(&[&show_item, &settings_item, &separator, &quit_item])
+        .context("build tray menu")?;
+
+    let tray_icon = TrayIconBuilder::new()
+        .with_menu(Box::new(tray_menu))
+        .with_tooltip(APP_NAME)
+        .with_title("📋")
+        .with_menu_on_left_click(true)
+        .build()
+        .context("create tray icon")?;
+
+    Ok(TrayState {
+        _tray_icon: tray_icon,
+    })
+}
+
+fn start_clipboard_watcher(store: Arc<Mutex<HistoryStore>>) {
+    thread::spawn(move || {
+        let mut clipboard = match Clipboard::new() {
+            Ok(clipboard) => clipboard,
+            Err(err) => {
+                eprintln!("Could not open clipboard: {err:#}");
+                return;
+            }
+        };
+        let mut monitor = ClipboardMonitor::new();
+        let mut last_hash = String::new();
+        let mut last_expiry_check = Instant::now();
+
+        loop {
+            if last_expiry_check.elapsed() >= EXPIRY_CHECK_INTERVAL {
+                last_expiry_check = Instant::now();
+                if let Ok(mut store) = store.lock() {
+                    if let Err(err) = store.remove_expired(Local::now()) {
+                        eprintln!("Could not remove expired items: {err:#}");
+                    }
+                }
+            }
+            if monitor.should_read_clipboard() {
+                if let Some(snapshot) = read_clipboard(&mut clipboard) {
+                    let snapshot_hash = snapshot.hash().to_owned();
+                    if snapshot_hash != last_hash {
+                        last_hash = snapshot_hash;
+                        if let Ok(mut store) = store.lock() {
+                            if let Err(err) = store.push(snapshot) {
+                                eprintln!("Could not save clipboard item: {err:#}");
+                            }
+                        }
+                    }
+                }
+            }
+            thread::sleep(CHANGE_COUNT_CHECK_INTERVAL);
+        }
+    });
+}
+
+struct ClipboardMonitor {
+    last_change_count: i64,
+}
+
+impl ClipboardMonitor {
+    fn new() -> Self {
+        Self {
+            last_change_count: clipboard_change_count(),
+        }
+    }
+
+    fn should_read_clipboard(&mut self) -> bool {
+        let change_count = clipboard_change_count();
+        let changed = self.last_change_count != change_count;
+        self.last_change_count = change_count;
+        changed
+    }
+}
+
+fn clipboard_change_count() -> i64 {
+    NSPasteboard::generalPasteboard().changeCount() as i64
+}
+
+fn read_clipboard(clipboard: &mut Clipboard) -> Option<ClipboardSnapshot> {
+    if let Some(paths) = read_file_paths_from_pasteboard() {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"files:");
+        for path in &paths {
+            hasher.update(path.to_string_lossy().as_bytes());
+            hasher.update(b"\0");
+        }
+        return Some(ClipboardSnapshot::Files {
+            paths,
+            hash: hasher.finalize().to_hex().to_string(),
+        });
+    }
+
+    // Check image before text: Safari (and other browsers) place both image data
+    // and a text URL on the pasteboard when copying an image. Checking image first
+    // ensures we capture the actual image rather than the URL text.
+    if let Ok(image) = clipboard.get_image() {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"image:");
+        hasher.update(&(image.width as u64).to_le_bytes());
+        hasher.update(&(image.height as u64).to_le_bytes());
+        hasher.update(&image.bytes);
+        return Some(ClipboardSnapshot::Image {
+            width: image.width,
+            height: image.height,
+            rgba: image.bytes.into_owned(),
+            hash: hasher.finalize().to_hex().to_string(),
+        });
+    }
+
+    if let Ok(text) = clipboard.get_text() {
+        let text = text.trim_end_matches('\0').to_owned();
+        if !text.trim().is_empty() {
+            let hash = text_hash(&text);
+            return Some(ClipboardSnapshot::Text { text, hash });
+        }
+    }
+
+    None
+}
+
+fn text_hash(text: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"text:");
+    hasher.update(text.as_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
+fn read_file_paths_from_pasteboard() -> Option<Vec<PathBuf>> {
+    let pasteboard = NSPasteboard::generalPasteboard();
+    let mut paths = Vec::new();
+
+    if let Some(items) = pasteboard.pasteboardItems() {
+        for item in items.iter() {
+            if let Some(value) = item.stringForType(unsafe { NSPasteboardTypeFileURL }) {
+                if let Some(path) = file_path_from_file_url_string(&value.to_string()) {
+                    paths.push(path);
+                }
+            }
+        }
+    }
+
+    if paths.is_empty() {
+        if let Some(value) = pasteboard.stringForType(unsafe { NSPasteboardTypeFileURL }) {
+            if let Some(path) = file_path_from_file_url_string(&value.to_string()) {
+                paths.push(path);
+            }
+        }
+    }
+
+    paths.dedup();
+    (!paths.is_empty()).then_some(paths)
+}
+
+fn file_path_from_file_url_string(value: &str) -> Option<PathBuf> {
+    let url = Url::parse(value.trim()).ok()?;
+    if url.scheme() != "file" {
+        return None;
+    }
+    let path = url.to_file_path().ok()?;
+    path.exists().then_some(path)
+}
+
+enum ClipboardSnapshot {
+    Text {
+        text: String,
+        hash: String,
+    },
+    Files {
+        paths: Vec<PathBuf>,
+        hash: String,
+    },
+    Image {
+        width: usize,
+        height: usize,
+        rgba: Vec<u8>,
+        hash: String,
+    },
+}
+
+impl ClipboardSnapshot {
+    fn hash(&self) -> &str {
+        match self {
+            Self::Text { hash, .. } | Self::Files { hash, .. } | Self::Image { hash, .. } => hash,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct AppSettings {
+    #[serde(default)]
+    theme: ThemeMode,
+    #[serde(default = "default_history_limit")]
+    history_limit: usize,
+    #[serde(default)]
+    launch_at_login: bool,
+    #[serde(default)]
+    api_enabled: bool,
+    #[serde(default = "default_api_port")]
+    api_port: u16,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            theme: ThemeMode::Dark,
+            history_limit: DEFAULT_HISTORY_LIMIT,
+            launch_at_login: launch_agent_enabled(),
+            api_enabled: false,
+            api_port: ingest::DEFAULT_API_PORT,
+        }
+    }
+}
+
+fn default_history_limit() -> usize {
+    DEFAULT_HISTORY_LIMIT
+}
+
+fn default_api_port() -> u16 {
+    ingest::DEFAULT_API_PORT
+}
+
+impl AppSettings {
+    fn load() -> Result<Self> {
+        let data_dir = default_data_dir();
+        fs::create_dir_all(&data_dir).context("create settings directory")?;
+        let path = settings_path(&data_dir);
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+
+        let bytes = fs::read(path).context("read settings file")?;
+        let mut settings: Self = serde_json::from_slice(&bytes).context("parse settings file")?;
+        settings.history_limit = settings
+            .history_limit
+            .clamp(MIN_HISTORY_LIMIT, MAX_HISTORY_LIMIT);
+        settings.launch_at_login = launch_agent_enabled();
+        Ok(settings)
+    }
+
+    fn save(&self) -> Result<()> {
+        let data_dir = default_data_dir();
+        fs::create_dir_all(&data_dir).context("create settings directory")?;
+        let bytes = serde_json::to_vec_pretty(self).context("serialize settings")?;
+        fs::write(settings_path(&data_dir), bytes).context("write settings")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum ThemeMode {
+    Light,
+    Dark,
+}
+
+impl Default for ThemeMode {
+    fn default() -> Self {
+        Self::Dark
+    }
+}
+
+impl ThemeMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Light => "Light",
+            Self::Dark => "Dark",
+        }
+    }
+}
+
+fn apply_theme(ctx: &egui::Context, theme: ThemeMode) {
+    match theme {
+        ThemeMode::Light => ctx.set_visuals(egui::Visuals::light()),
+        ThemeMode::Dark => ctx.set_visuals(egui::Visuals::dark()),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct HistoryStore {
+    data_dir: PathBuf,
+    max_items: usize,
+    items: Vec<ClipItem>,
+    suppressed_hashes: Vec<String>,
+}
+
+impl HistoryStore {
+    fn new(data_dir: PathBuf, max_items: usize) -> Self {
+        Self {
+            data_dir,
+            max_items,
+            items: Vec::new(),
+            suppressed_hashes: Vec::new(),
+        }
+    }
+
+    fn load(max_items: usize) -> Result<Self> {
+        let data_dir = default_data_dir();
+        fs::create_dir_all(images_dir(&data_dir)).context("create data directories")?;
+
+        let history_path = history_path(&data_dir);
+        if !history_path.exists() {
+            return Ok(Self::new(data_dir, max_items));
+        }
+
+        let bytes = fs::read(&history_path).context("read history file")?;
+        let mut items: Vec<ClipItem> =
+            serde_json::from_slice(&bytes).context("parse history file")?;
+        items.truncate(max_items);
+        let changed = items.iter_mut().fold(false, |changed, item| {
+            normalize_loaded_item(item) || changed
+        });
+        let store = Self {
+            data_dir,
+            max_items,
+            items,
+            suppressed_hashes: Vec::new(),
+        };
+        if changed {
+            store.save().context("save normalized history")?;
+        }
+        Ok(store)
+    }
+
+    fn push(&mut self, snapshot: ClipboardSnapshot) -> Result<()> {
+        let hash = snapshot.hash().to_owned();
+        if let Some(index) = self
+            .suppressed_hashes
+            .iter()
+            .position(|suppressed| suppressed == &hash)
+        {
+            self.suppressed_hashes.remove(index);
+            return Ok(());
+        }
+        if self.items.first().is_some_and(|item| item.hash == hash) {
+            return Ok(());
+        }
+
+        let item = match snapshot {
+            ClipboardSnapshot::Text { text, hash } => ClipItem::from_text(text, hash),
+            ClipboardSnapshot::Files { paths, hash } => ClipItem::from_files(paths, hash),
+            ClipboardSnapshot::Image {
+                width,
+                height,
+                rgba,
+                hash,
+            } => self.item_from_image(width, height, rgba, hash)?,
+        };
+
+        self.insert_item(item)
+    }
+
+    /// Adds a new item at the top. Any older copy of the same content is replaced
+    /// (keeping its star), and one-time codes are dropped because they've been superseded.
+    fn insert_item(&mut self, mut item: ClipItem) -> Result<()> {
+        if let Some(existing) = self
+            .items
+            .iter()
+            .find(|existing| existing.hash == item.hash)
+        {
+            item.starred |= existing.starred;
+        }
+        let hash = item.hash.clone();
+        let mut removed = Vec::new();
+        self.items.retain(|existing| {
+            let keep = existing.hash != hash && existing.kind != ClipKind::OneTimeCode;
+            if !keep {
+                removed.push(existing.clone());
+            }
+            keep
+        });
+        for old in removed {
+            self.delete_image_file(&old);
+        }
+
+        self.items.insert(0, item);
+        self.prune_to_limit();
+        self.save()
+    }
+
+    fn remove(&mut self, id: Uuid) -> Result<()> {
+        let Some(index) = self.items.iter().position(|item| item.id == id) else {
+            return Ok(());
+        };
+        let item = self.items.remove(index);
+        self.delete_image_file(&item);
+        self.save()
+    }
+
+    fn remove_expired(&mut self, now: DateTime<Local>) -> Result<()> {
+        let before = self.items.len();
+        self.items
+            .retain(|item| item.expires_at.is_none_or(|expires_at| expires_at > now));
+        if self.items.len() == before {
+            return Ok(());
+        }
+        self.save()
+    }
+
+    fn toggle_star(&mut self, id: Uuid) -> Result<bool> {
+        let Some(item) = self.items.iter_mut().find(|item| item.id == id) else {
+            return Ok(false);
+        };
+        item.starred = !item.starred;
+        let starred = item.starred;
+        self.save()?;
+        Ok(starred)
+    }
+
+    fn delete_image_file(&self, item: &ClipItem) {
+        if let Some(image) = &item.image {
+            let _ = fs::remove_file(self.data_dir.join(&image.path));
+        }
+    }
+
+    /// Copying anything else supersedes one-time codes, so they leave history.
+    fn drop_one_time_codes_except(&mut self, id: Uuid) -> Result<()> {
+        let before = self.items.len();
+        self.items
+            .retain(|item| item.id == id || item.kind != ClipKind::OneTimeCode);
+        if self.items.len() == before {
+            return Ok(());
+        }
+        self.save()
+    }
+
+    fn suppress_next_hash(&mut self, hash: &str) {
+        if !self
+            .suppressed_hashes
+            .iter()
+            .any(|suppressed| suppressed == hash)
+        {
+            self.suppressed_hashes.push(hash.to_owned());
+        }
+    }
+
+    fn allow_hash(&mut self, hash: &str) {
+        if let Some(index) = self
+            .suppressed_hashes
+            .iter()
+            .position(|suppressed| suppressed == hash)
+        {
+            self.suppressed_hashes.remove(index);
+        }
+    }
+
+    /// Moves an item back to the top after it is copied again. Copying something
+    /// else supersedes any one-time codes still in history.
+    fn promote(&mut self, id: Uuid) -> Result<()> {
+        self.drop_one_time_codes_except(id)?;
+        let Some(index) = self.items.iter().position(|item| item.id == id) else {
+            return Ok(());
+        };
+        if index == 0 {
+            return Ok(());
+        }
+
+        let item = self.items.remove(index);
+        self.items.insert(0, item);
+        self.save()
+    }
+
+    fn set_max_items(&mut self, max_items: usize) -> Result<()> {
+        self.max_items = max_items.clamp(MIN_HISTORY_LIMIT, MAX_HISTORY_LIMIT);
+        self.prune_to_limit();
+        self.save()
+    }
+
+    /// Starred items never count toward the limit and are never pruned.
+    fn prune_to_limit(&mut self) {
+        let mut unstarred = 0;
+        let mut removed = Vec::new();
+        let max_items = self.max_items;
+        self.items.retain(|item| {
+            if item.starred {
+                return true;
+            }
+            unstarred += 1;
+            let keep = unstarred <= max_items;
+            if !keep {
+                removed.push(item.clone());
+            }
+            keep
+        });
+        for item in removed {
+            self.delete_image_file(&item);
+        }
+    }
+
+    fn save(&self) -> Result<()> {
+        fs::create_dir_all(images_dir(&self.data_dir)).context("create data directories")?;
+        let bytes = serde_json::to_vec_pretty(&self.items).context("serialize history")?;
+        fs::write(history_path(&self.data_dir), bytes).context("write history")
+    }
+
+    fn item_from_image(
+        &self,
+        width: usize,
+        height: usize,
+        rgba: Vec<u8>,
+        hash: String,
+    ) -> Result<ClipItem> {
+        fs::create_dir_all(images_dir(&self.data_dir)).context("create images directory")?;
+        let file_name = format!("{}.png", Uuid::new_v4());
+        let relative = PathBuf::from("images").join(file_name);
+        let absolute = self.data_dir.join(&relative);
+
+        let buffer = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(width as u32, height as u32, rgba)
+            .context("build image buffer from clipboard bytes")?;
+        buffer.save(&absolute).context("save clipboard image")?;
+
+        Ok(ClipItem {
+            id: Uuid::new_v4(),
+            kind: ClipKind::Image,
+            summary: format!("{width} x {height} image"),
+            text: None,
+            image: Some(ImageClip {
+                path: relative,
+                width,
+                height,
+            }),
+            files: Vec::new(),
+            created_at: Local::now(),
+            hash,
+            ..ClipItem::default()
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ClipItem {
+    id: Uuid,
+    kind: ClipKind,
+    summary: String,
+    text: Option<String>,
+    image: Option<ImageClip>,
+    #[serde(default)]
+    files: Vec<PathBuf>,
+    created_at: DateTime<Local>,
+    hash: String,
+    /// App that pushed this item through the local API.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
+    /// Removed from history once this passes (one-time codes only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expires_at: Option<DateTime<Local>>,
+    #[serde(default)]
+    starred: bool,
+}
+
+impl Default for ClipItem {
+    fn default() -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            kind: ClipKind::Text,
+            summary: String::new(),
+            text: None,
+            image: None,
+            files: Vec::new(),
+            created_at: Local::now(),
+            hash: String::new(),
+            source: None,
+            label: None,
+            expires_at: None,
+            starred: false,
+        }
+    }
+}
+
+impl ClipItem {
+    fn from_text(text: String, hash: String) -> Self {
+        let kind = classify_text(&text);
+
+        Self {
+            id: Uuid::new_v4(),
+            kind,
+            summary: summary_for_text(&text),
+            text: Some(text),
+            hash,
+            ..Self::default()
+        }
+    }
+
+    fn from_files(paths: Vec<PathBuf>, hash: String) -> Self {
+        Self {
+            kind: ClipKind::Files,
+            summary: summary_for_files(&paths),
+            files: paths,
+            hash,
+            ..Self::default()
+        }
+    }
+
+    fn from_ingest(request: &IngestRequest) -> Self {
+        let hash = text_hash(&request.text);
+        let mut item = match request.kind {
+            IngestKind::Text => Self::from_text(request.text.clone(), hash),
+            // Codes are short-lived and need to be read, so they skip masking.
+            IngestKind::OneTimeCode => Self {
+                kind: ClipKind::OneTimeCode,
+                summary: summarize_text(&request.text),
+                text: Some(request.text.clone()),
+                hash,
+                expires_at: Some(Local::now() + ONE_TIME_CODE_TTL),
+                ..Self::default()
+            },
+        };
+        item.source = Some(request.source.clone());
+        item.label = request.label.clone();
+        item
+    }
+
+    fn metadata_line(&self) -> String {
+        let mut parts = vec![self.kind.label().to_owned()];
+        if let Some(source) = &self.source {
+            parts.push(format!("from {source}"));
+        }
+        if let Some(label) = &self.label {
+            parts.push(label.clone());
+        }
+        parts.push(self.created_at.format("%H:%M:%S").to_string());
+        parts.join(" · ")
+    }
+
+    fn matches_query(&self, query: &str) -> bool {
+        [
+            Some(self.summary.as_str()),
+            self.text.as_deref(),
+            self.source.as_deref(),
+            self.label.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|field| field.to_lowercase().contains(query))
+    }
+
+    /// Whether the full-text viewer applies (images use the image preview instead).
+    fn has_viewable_text(&self) -> bool {
+        self.kind != ClipKind::Image && self.text.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum ClipKind {
+    Text,
+    Url,
+    FilePath,
+    Email,
+    Phone,
+    Image,
+    Files,
+    OneTimeCode,
+}
+
+impl ClipKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Text => "Text",
+            Self::Url => "URL",
+            Self::FilePath => "File",
+            Self::Email => "Email",
+            Self::Phone => "Phone",
+            Self::Image => "Image",
+            Self::Files => "Files",
+            Self::OneTimeCode => "Code",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ImageClip {
+    path: PathBuf,
+    width: usize,
+    height: usize,
+}
+
+struct BetterClipboardApp {
+    store: Arc<Mutex<HistoryStore>>,
+    shortcut: Option<ShortcutState>,
+    _tray: Option<TrayState>,
+    event_receiver: mpsc::Receiver<AppEvent>,
+    settings: AppSettings,
+    settings_open: bool,
+    permission_onboarding: bool,
+    permission_prompt_after: Option<Instant>,
+    permission_prompt_requested: bool,
+    selected: Option<Uuid>,
+    status: String,
+    textures: std::collections::HashMap<Uuid, TextureHandle>,
+    window_visible: bool,
+    force_quit: bool,
+    select_first_on_show: bool,
+    palette_expanded: bool,
+    preview_item: Option<ItemPreviewState>,
+    share_picker: Option<Retained<NSSharingServicePicker>>,
+    previous_frontmost_pid: Option<i32>,
+    shown_at: Instant,
+    focus_loss_started: Option<Instant>,
+    scroll_selected_into_view: bool,
+    last_repaint: Instant,
+    search_active: bool,
+    search_query: String,
+    search_focus_requested: bool,
+    starred_only: bool,
+    api_token: Arc<RwLock<String>>,
+    api_server: Option<IngestServer>,
+    api_status: String,
+    _notification_delegate: Option<Retained<notify::NotificationDelegate>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ItemPreviewState {
+    item_id: Uuid,
+}
+
+impl BetterClipboardApp {
+    fn new(
+        store: Arc<Mutex<HistoryStore>>,
+        shortcut: Option<ShortcutState>,
+        ctx: egui::Context,
+        settings: AppSettings,
+        permission_onboarding: bool,
+    ) -> Self {
+        apply_theme(&ctx, settings.theme);
+        let (event_sender, event_receiver) = setup_event_handlers(ctx.clone());
+        let notification_ctx = ctx.clone();
+        let notification_delegate = notify::install(move |identifier| {
+            if let Ok(id) = Uuid::parse_str(&identifier) {
+                let _ = event_sender.send(AppEvent::ShowItem(id));
+                notification_ctx.request_repaint();
+            }
+        });
+        let (tray, status) = match setup_tray_icon() {
+            Ok(tray) => (Some(tray), "Watching clipboard".to_owned()),
+            Err(err) => (
+                None,
+                format!("Watching clipboard; tray icon unavailable: {err:#}"),
+            ),
+        };
+        let status = if permission_onboarding {
+            "Better Clipboard needs Accessibility permission for automatic paste.".to_owned()
+        } else {
+            status
+        };
+
+        Self {
+            store,
+            shortcut,
+            _tray: tray,
+            event_receiver,
+            settings,
+            settings_open: false,
+            permission_onboarding,
+            permission_prompt_after: None,
+            permission_prompt_requested: false,
+            selected: None,
+            status,
+            textures: std::collections::HashMap::new(),
+            window_visible: permission_onboarding,
+            force_quit: false,
+            select_first_on_show: true,
+            palette_expanded: false,
+            preview_item: None,
+            share_picker: None,
+            previous_frontmost_pid: None,
+            shown_at: Instant::now(),
+            focus_loss_started: None,
+            scroll_selected_into_view: false,
+            last_repaint: Instant::now(),
+            search_active: false,
+            search_query: String::new(),
+            search_focus_requested: false,
+            starred_only: false,
+            api_token: Arc::new(RwLock::new(String::new())),
+            api_server: None,
+            api_status: String::new(),
+            _notification_delegate: notification_delegate,
+        }
+        .with_api_started(&ctx)
+    }
+
+    fn with_api_started(mut self, ctx: &egui::Context) -> Self {
+        self.sync_api_server(ctx);
+        self
+    }
+
+    /// Starts or stops the local ingest API to match settings.
+    fn sync_api_server(&mut self, ctx: &egui::Context) {
+        if !self.settings.api_enabled {
+            if let Some(mut server) = self.api_server.take() {
+                server.stop();
+            }
+            self.api_status = "Local API is off".to_owned();
+            return;
+        }
+        if self.api_server.is_some() {
+            return;
+        }
+
+        let data_dir = self.store.lock().map(|store| store.data_dir.clone());
+        let data_dir = data_dir.unwrap_or_else(|_| default_data_dir());
+        match ingest::load_or_create_token(&data_dir) {
+            Ok(token) => {
+                if let Ok(mut current) = self.api_token.write() {
+                    *current = token;
+                }
+            }
+            Err(err) => {
+                self.api_status = format!("Local API token unavailable: {err:#}");
+                return;
+            }
+        }
+
+        let store = Arc::clone(&self.store);
+        let handler_ctx = ctx.clone();
+        let handler = Box::new(move |request: IngestRequest| {
+            let id = ingest_clip(&store, &request).map_err(|err| format!("{err:#}"))?;
+            if request.notify {
+                let (title, body) = notification_text(&request);
+                notify::post(&id.to_string(), &title, &body);
+            }
+            handler_ctx.request_repaint();
+            Ok(id.to_string())
+        });
+
+        let port = self.settings.api_port;
+        match IngestServer::start(port, Arc::clone(&self.api_token), handler) {
+            Ok(server) => {
+                self.api_server = Some(server);
+                self.api_status = format!("Listening on 127.0.0.1:{port}");
+                notify::request_authorization();
+            }
+            Err(err) => {
+                self.api_status = format!("Local API failed to start: {err:#}");
+            }
+        }
+    }
+
+    fn regenerate_api_token(&mut self) {
+        let data_dir = self.store.lock().map(|store| store.data_dir.clone());
+        let data_dir = data_dir.unwrap_or_else(|_| default_data_dir());
+        match ingest::regenerate_token(&data_dir) {
+            Ok(token) => {
+                if let Ok(mut current) = self.api_token.write() {
+                    *current = token;
+                }
+                self.status = "API token regenerated; update your clients".to_owned();
+            }
+            Err(err) => self.status = format!("Token regenerate failed: {err:#}"),
+        }
+    }
+
+    /// Copies the API token without recording it in history.
+    fn copy_api_token(&mut self) {
+        let token = self
+            .api_token
+            .read()
+            .map(|token| token.clone())
+            .unwrap_or_default();
+        if token.is_empty() {
+            return;
+        }
+        if let Ok(mut store) = self.store.lock() {
+            store.suppress_next_hash(&text_hash(&token));
+        }
+        self.status = match Clipboard::new().and_then(|mut clipboard| clipboard.set_text(token)) {
+            Ok(()) => "API token copied (not saved to history)".to_owned(),
+            Err(err) => format!("Copy token failed: {err}"),
+        };
+    }
+
+    fn toggle_star(&mut self, id: Uuid) {
+        if let Ok(mut store) = self.store.lock() {
+            self.status = match store.toggle_star(id) {
+                Ok(true) => "Starred".to_owned(),
+                Ok(false) => "Unstarred".to_owned(),
+                Err(err) => format!("Star failed: {err:#}"),
+            };
+        }
+    }
+
+    fn handle_app_events(&mut self, ctx: &egui::Context) {
+        while let Ok(event) = self.event_receiver.try_recv() {
+            match event {
+                AppEvent::Hotkey(id) => {
+                    if self
+                        .shortcut
+                        .as_ref()
+                        .is_some_and(|shortcut| shortcut.hotkey_ids.contains(&id))
+                    {
+                        self.toggle_window(ctx);
+                    }
+                }
+                AppEvent::TrayMenu(id) if id == TRAY_SHOW_ID => {
+                    self.show_window(ctx);
+                }
+                AppEvent::TrayMenu(id) if id == TRAY_SETTINGS_ID => {
+                    self.show_settings_window(ctx);
+                }
+                AppEvent::TrayMenu(id) if id == TRAY_QUIT_ID => {
+                    self.force_quit = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                AppEvent::TrayMenu(_) => {}
+                AppEvent::ShowItem(id) => {
+                    self.show_window(ctx);
+                    self.starred_only = false;
+                    self.selected = Some(id);
+                    self.select_first_on_show = false;
+                    self.scroll_selected_into_view = true;
+                }
+            }
+        }
+    }
+
+    fn show_window(&mut self, ctx: &egui::Context) {
+        self.previous_frontmost_pid = frontmost_application_pid();
+        self.window_visible = true;
+        self.select_first_on_show = true;
+        self.palette_expanded = false;
+        self.settings_open = false;
+        self.permission_onboarding = false;
+        self.close_preview(ctx);
+        self.scroll_selected_into_view = true;
+        self.shown_at = Instant::now();
+        self.focus_loss_started = None;
+        self.resize_palette(ctx);
+        if let Some(command) = egui::ViewportCommand::center_on_screen(ctx) {
+            ctx.send_viewport_cmd(command);
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+            egui::WindowLevel::AlwaysOnTop,
+        ));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+
+    fn show_settings_window(&mut self, ctx: &egui::Context) {
+        self.show_window(ctx);
+        self.settings_open = true;
+        self.resize_palette(ctx);
+    }
+
+    fn toggle_window(&mut self, ctx: &egui::Context) {
+        if self.window_visible {
+            self.hide_window(ctx);
+        } else {
+            self.show_window(ctx);
+        }
+    }
+
+    fn hide_window(&mut self, ctx: &egui::Context) {
+        self.window_visible = false;
+        self.settings_open = false;
+        self.permission_onboarding = false;
+        self.focus_loss_started = None;
+        self.search_active = false;
+        self.search_query.clear();
+        self.search_focus_requested = false;
+        self.close_preview(ctx);
+        self.close_share_picker();
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+    }
+
+    fn resize_palette(&self, ctx: &egui::Context) {
+        let height = if self.settings_open {
+            SETTINGS_HEIGHT
+        } else if self.palette_expanded {
+            EXPANDED_HEIGHT
+        } else {
+            COMPACT_HEIGHT
+        };
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(620.0, height)));
+    }
+
+    fn set_expanded(&mut self, expanded: bool, ctx: &egui::Context) {
+        self.palette_expanded = expanded;
+        self.settings_open = false;
+        self.resize_palette(ctx);
+    }
+
+    fn save_settings(&mut self) {
+        if let Err(err) = self.settings.save() {
+            self.status = format!("Settings save failed: {err:#}");
+        }
+    }
+
+    fn set_history_limit(&mut self, limit: usize) {
+        let limit = limit.clamp(MIN_HISTORY_LIMIT, MAX_HISTORY_LIMIT);
+        self.settings.history_limit = limit;
+        if let Ok(mut store) = self.store.lock() {
+            if let Err(err) = store.set_max_items(limit) {
+                self.status = format!("History prune failed: {err:#}");
+            }
+        }
+        self.save_settings();
+    }
+
+    fn set_launch_at_login(&mut self, enabled: bool) {
+        match set_launch_agent_enabled(enabled) {
+            Ok(()) => {
+                self.settings.launch_at_login = enabled;
+                self.status = if enabled {
+                    "Run at login enabled".to_owned()
+                } else {
+                    "Run at login disabled".to_owned()
+                };
+                self.save_settings();
+            }
+            Err(err) => {
+                self.status = format!("Run at login update failed: {err:#}");
+                self.settings.launch_at_login = launch_agent_enabled();
+            }
+        }
+    }
+
+    fn copy_item(&mut self, item: &ClipItem, data_dir: &Path) -> bool {
+        // Suppress the hash before writing so the watcher thread won't race
+        // and create a duplicate entry with a new UUID/timestamp.
+        if let Ok(mut store) = self.store.lock() {
+            store.suppress_next_hash(&item.hash);
+        }
+
+        match copy_item_to_clipboard(item, data_dir) {
+            Ok(()) => {
+                let mut status = format!("Copied {}", item.kind.label().to_lowercase());
+                if let Ok(mut store) = self.store.lock() {
+                    store.allow_hash(&item.hash);
+                    if let Err(err) = store.promote(item.id) {
+                        status = format!("Copied; history update failed: {err:#}");
+                    }
+                }
+                self.status = status;
+                self.selected = Some(item.id);
+                true
+            }
+            Err(err) => {
+                if let Ok(mut store) = self.store.lock() {
+                    store.allow_hash(&item.hash);
+                }
+                self.status = format!("Copy failed: {err:#}");
+                false
+            }
+        }
+    }
+
+    fn copy_item_without_history_move(
+        &mut self,
+        item: &ClipItem,
+        data_dir: &Path,
+        status: &str,
+    ) -> bool {
+        if let Ok(mut store) = self.store.lock() {
+            store.suppress_next_hash(&item.hash);
+        }
+
+        match copy_item_to_clipboard(item, data_dir) {
+            Ok(()) => {
+                self.status = status.to_owned();
+                if let Ok(mut store) = self.store.lock() {
+                    if let Err(err) = store.drop_one_time_codes_except(item.id) {
+                        self.status = format!("Copied; history update failed: {err:#}");
+                    }
+                }
+                self.selected = Some(item.id);
+                true
+            }
+            Err(err) => {
+                if let Ok(mut store) = self.store.lock() {
+                    store.allow_hash(&item.hash);
+                }
+                self.status = format!("Copy failed: {err:#}");
+                false
+            }
+        }
+    }
+
+    fn copy_item_and_hide(
+        &mut self,
+        item: &ClipItem,
+        data_dir: &Path,
+        ctx: &egui::Context,
+        status: &str,
+    ) {
+        if self.copy_item_without_history_move(item, data_dir, status) {
+            self.close_preview(ctx);
+            self.hide_window(ctx);
+        }
+    }
+
+    fn copy_and_paste_item(&mut self, item: &ClipItem, data_dir: &Path, ctx: &egui::Context) {
+        if self.copy_item(item, data_dir) {
+            self.status = format!(
+                "Copied {}; paste requested",
+                item.kind.label().to_lowercase()
+            );
+            // A code is used once it has been pasted, so drop it from history.
+            if item.kind == ClipKind::OneTimeCode {
+                if let Ok(mut store) = self.store.lock() {
+                    let _ = store.remove(item.id);
+                }
+            }
+            self.close_preview(ctx);
+            self.hide_window(ctx);
+            let target_pid = self.previous_frontmost_pid;
+            thread::spawn(move || {
+                thread::sleep(PASTE_DELAY);
+                let _ = paste_current_clipboard(target_pid);
+            });
+        }
+    }
+
+    fn ensure_selection(&mut self, visible_items: &[ClipItem]) {
+        if visible_items.is_empty() {
+            self.selected = None;
+            self.select_first_on_show = false;
+            return;
+        }
+
+        let selected_is_visible = self
+            .selected
+            .is_some_and(|id| visible_items.iter().any(|item| item.id == id));
+
+        if self.select_first_on_show || !selected_is_visible {
+            self.selected = Some(visible_items[0].id);
+            self.select_first_on_show = false;
+            self.scroll_selected_into_view = true;
+        }
+    }
+
+    fn selected_index(&self, visible_items: &[ClipItem]) -> Option<usize> {
+        let selected = self.selected?;
+        visible_items.iter().position(|item| item.id == selected)
+    }
+
+    fn move_selection(&mut self, visible_items: &[ClipItem], delta: isize) {
+        if visible_items.is_empty() {
+            self.selected = None;
+            return;
+        }
+
+        let current = self.selected_index(visible_items).unwrap_or(0);
+        let max = visible_items.len() as isize - 1;
+        let next = (current as isize + delta).clamp(0, max) as usize;
+        self.selected = Some(visible_items[next].id);
+        self.scroll_selected_into_view = true;
+    }
+
+    fn close_preview(&mut self, ctx: &egui::Context) {
+        if self.preview_item.take().is_some() {
+            ctx.send_viewport_cmd_to(preview_viewport_id(), egui::ViewportCommand::Close);
+        }
+    }
+
+    /// Opens the image preview or the full-text viewer, whichever fits the item.
+    fn open_preview(&mut self, item: &ClipItem, ctx: &egui::Context) {
+        if item.kind == ClipKind::Image || item.has_viewable_text() {
+            self.preview_item = Some(ItemPreviewState { item_id: item.id });
+            ctx.request_repaint();
+        }
+    }
+
+    fn close_share_picker(&mut self) {
+        if let Some(picker) = self.share_picker.take() {
+            picker.close();
+        }
+    }
+
+    fn run_item_action(&mut self, item: &ClipItem, data_dir: &Path, ctx: &egui::Context) {
+        match item.kind {
+            ClipKind::Text | ClipKind::OneTimeCode => {
+                self.copy_item(item, data_dir);
+            }
+            ClipKind::Url => {
+                self.open_url(item, ctx);
+            }
+            ClipKind::FilePath => {
+                self.reveal_file_in_finder(item, ctx);
+            }
+            ClipKind::Files => {
+                self.reveal_file_in_finder(item, ctx);
+            }
+            ClipKind::Email => {
+                self.open_email(item, ctx);
+            }
+            ClipKind::Phone => {
+                self.open_phone(item, ctx);
+            }
+            ClipKind::Image => {
+                self.open_preview(item, ctx);
+            }
+        }
+    }
+
+    fn open_item(&mut self, item: &ClipItem, data_dir: &Path, ctx: &egui::Context) {
+        match item.kind {
+            ClipKind::Text | ClipKind::OneTimeCode => {
+                self.copy_item(item, data_dir);
+            }
+            ClipKind::Url => self.open_url(item, ctx),
+            ClipKind::FilePath => self.open_file_path(item, ctx),
+            ClipKind::Files => self.open_file_path(item, ctx),
+            ClipKind::Email => self.open_email(item, ctx),
+            ClipKind::Phone => self.open_phone(item, ctx),
+            ClipKind::Image => self.open_preview(item, ctx),
+        }
+    }
+
+    fn open_url(&mut self, item: &ClipItem, ctx: &egui::Context) {
+        let Some(url) = item.text.as_deref().map(str::trim) else {
+            self.status = "Open URL failed: missing URL payload".to_owned();
+            return;
+        };
+
+        if let Err(err) = Url::parse(url) {
+            self.status = format!("Open URL failed: {err}");
+            return;
+        }
+
+        self.open_with_macos(url, "Opened URL", "Open URL failed", Some(item.id), ctx);
+    }
+
+    fn open_file_path(&mut self, item: &ClipItem, ctx: &egui::Context) {
+        let paths = file_paths_for_item(item);
+        if paths.is_empty() {
+            self.status = "Open file failed: file path is unavailable".to_owned();
+            return;
+        }
+        self.open_paths_with_macos(
+            &paths,
+            "Opened file",
+            "Open file failed",
+            Some(item.id),
+            ctx,
+        );
+    }
+
+    fn reveal_file_in_finder(&mut self, item: &ClipItem, ctx: &egui::Context) {
+        let Some(path) = file_paths_for_item(item).into_iter().next() else {
+            self.status = "Reveal failed: file path is unavailable".to_owned();
+            return;
+        };
+
+        match Command::new("open").arg("-R").arg(path).spawn() {
+            Ok(_) => {
+                self.status = "Revealed in Finder".to_owned();
+                self.selected = Some(item.id);
+                self.hide_window(ctx);
+            }
+            Err(err) => {
+                self.status = format!("Reveal failed: {err}");
+            }
+        }
+    }
+
+    fn open_email(&mut self, item: &ClipItem, ctx: &egui::Context) {
+        let Some(email) = item.text.as_deref().map(str::trim) else {
+            self.status = "Open email failed: missing email payload".to_owned();
+            return;
+        };
+        if !is_email_address(email) {
+            self.status = "Open email failed: invalid email address".to_owned();
+            return;
+        }
+        let target = format!("mailto:{email}");
+        self.open_with_macos(
+            &target,
+            "Opened email composer",
+            "Open email failed",
+            Some(item.id),
+            ctx,
+        );
+    }
+
+    fn open_phone(&mut self, item: &ClipItem, ctx: &egui::Context) {
+        let Some(phone) = item.text.as_deref().and_then(phone_url) else {
+            self.status = "Open phone failed: invalid phone number".to_owned();
+            return;
+        };
+        self.open_with_macos(
+            &phone,
+            "Opened phone handler",
+            "Open phone failed",
+            Some(item.id),
+            ctx,
+        );
+    }
+
+    fn run_row_action(
+        &mut self,
+        action: RowAction,
+        item: &ClipItem,
+        data_dir: &Path,
+        ctx: &egui::Context,
+    ) {
+        match action {
+            RowAction::Paste => self.copy_and_paste_item(item, data_dir, ctx),
+            RowAction::Copy => self.copy_item_and_hide(
+                item,
+                data_dir,
+                ctx,
+                &format!("Copied {}", item.kind.label().to_lowercase()),
+            ),
+            RowAction::Open => self.open_item(item, data_dir, ctx),
+            RowAction::Reveal => self.reveal_file_in_finder(item, ctx),
+            RowAction::Preview => self.open_preview(item, ctx),
+            RowAction::Share => self.share_item(item, data_dir),
+            RowAction::Star => self.toggle_star(item.id),
+        }
+    }
+
+    fn open_with_macos(
+        &mut self,
+        target: &str,
+        success: &str,
+        failure: &str,
+        selected: Option<Uuid>,
+        ctx: &egui::Context,
+    ) {
+        match Command::new("open").arg(target).spawn() {
+            Ok(_) => {
+                self.status = success.to_owned();
+                self.selected = selected;
+                self.hide_window(ctx);
+            }
+            Err(err) => {
+                self.status = format!("{failure}: {err}");
+            }
+        }
+    }
+
+    fn open_paths_with_macos(
+        &mut self,
+        paths: &[PathBuf],
+        success: &str,
+        failure: &str,
+        selected: Option<Uuid>,
+        ctx: &egui::Context,
+    ) {
+        match Command::new("open").args(paths).spawn() {
+            Ok(_) => {
+                self.status = success.to_owned();
+                self.selected = selected;
+                self.hide_window(ctx);
+            }
+            Err(err) => {
+                self.status = format!("{failure}: {err}");
+            }
+        }
+    }
+
+    fn share_item(&mut self, item: &ClipItem, data_dir: &Path) {
+        match open_share_sheet(item, data_dir) {
+            Ok(picker) => {
+                self.share_picker = Some(picker);
+                self.status = format!("Sharing {}", item.kind.label().to_lowercase());
+                self.selected = Some(item.id);
+                self.focus_loss_started = None;
+            }
+            Err(err) => {
+                self.status = format!("Share failed: {err:#}");
+            }
+        }
+    }
+
+    fn handle_focus_loss(&mut self, ctx: &egui::Context) {
+        if !self.window_visible || self.permission_onboarding {
+            self.focus_loss_started = None;
+            return;
+        }
+
+        if self.shown_at.elapsed() < FOCUS_HIDE_GRACE {
+            return;
+        }
+
+        if better_clipboard_has_focus(ctx) {
+            self.focus_loss_started = None;
+            return;
+        }
+
+        let started = self.focus_loss_started.get_or_insert_with(Instant::now);
+        if started.elapsed() >= FOCUS_HIDE_GRACE {
+            self.hide_window(ctx);
+        } else {
+            ctx.request_repaint_after(FOCUS_HIDE_GRACE);
+        }
+    }
+
+    fn handle_keyboard(
+        &mut self,
+        ctx: &egui::Context,
+        visible_items: &[ClipItem],
+        data_dir: &Path,
+    ) {
+        let down = ctx.input(|input| input.key_pressed(Key::ArrowDown));
+        let up = ctx.input(|input| input.key_pressed(Key::ArrowUp));
+        let command_down =
+            ctx.input(|input| input.modifiers.command && input.key_pressed(Key::ArrowDown));
+        let command_up =
+            ctx.input(|input| input.modifiers.command && input.key_pressed(Key::ArrowUp));
+        let tab = ctx.input(|input| input.key_pressed(Key::Tab));
+        let enter = ctx.input(|input| input.key_pressed(Key::Enter));
+        let escape = ctx.input(|input| input.key_pressed(Key::Escape));
+        let right = ctx.input(|input| input.key_pressed(Key::ArrowRight));
+        let left = ctx.input(|input| input.key_pressed(Key::ArrowLeft));
+        let space = ctx.input(|input| input.key_pressed(Key::Space));
+        let star = ctx.input(|input| input.key_pressed(Key::Num8));
+
+        if self.preview_item.is_some() {
+            if right {
+                return;
+            }
+            if left || escape || space {
+                self.close_preview(ctx);
+                return;
+            }
+            if enter {
+                if let Some(index) = self.selected_index(visible_items) {
+                    self.copy_and_paste_item(&visible_items[index], data_dir, ctx);
+                }
+            }
+            if ctx.input(|input| input.key_pressed(Key::C)) {
+                if let Some(index) = self.selected_index(visible_items) {
+                    let item = &visible_items[index];
+                    self.copy_item_and_hide(
+                        item,
+                        data_dir,
+                        ctx,
+                        &format!("Copied {}", item.kind.label().to_lowercase()),
+                    );
+                }
+            }
+            if ctx.input(|input| input.key_pressed(Key::S)) {
+                if let Some(index) = self.selected_index(visible_items) {
+                    let item = &visible_items[index];
+                    self.close_preview(ctx);
+                    self.share_item(item, data_dir);
+                }
+            }
+            return;
+        }
+
+        if escape {
+            if self.search_active && !self.search_query.is_empty() {
+                self.search_query.clear();
+                self.select_first_on_show = true;
+            } else {
+                self.search_active = false;
+                self.search_query.clear();
+                self.search_focus_requested = false;
+                self.hide_window(ctx);
+            }
+            return;
+        }
+
+        if self.settings_open {
+            return;
+        }
+
+        // While search is active: only navigate (↑↓ Enter) — all letter keys feed the text field.
+        if self.search_active {
+            if down {
+                self.move_selection(visible_items, 1);
+                self.scroll_selected_into_view = true;
+            }
+            if up {
+                self.move_selection(visible_items, -1);
+                self.scroll_selected_into_view = true;
+            }
+            if enter {
+                if let Some(index) = self.selected_index(visible_items) {
+                    self.copy_and_paste_item(&visible_items[index], data_dir, ctx);
+                }
+            }
+            return;
+        }
+
+        // / opens search — consume the Text("/") event so it does not leak
+        // into the search field when focus is requested on the same frame.
+        let slash = ctx.input(|input| {
+            input.key_pressed(Key::Slash)
+                || input
+                    .events
+                    .iter()
+                    .any(|e| matches!(e, egui::Event::Text(t) if t == "/"))
+        });
+        if slash {
+            ctx.input_mut(|input| {
+                input
+                    .events
+                    .retain(|e| !matches!(e, egui::Event::Text(t) if t == "/"));
+            });
+            self.search_active = true;
+            self.search_query.clear();
+            self.search_focus_requested = true;
+            self.select_first_on_show = true;
+            self.set_expanded(true, ctx);
+            return;
+        }
+
+        if command_down || tab {
+            self.set_expanded(true, ctx);
+            return;
+        }
+
+        if command_up {
+            self.set_expanded(false, ctx);
+            return;
+        }
+
+        if down {
+            self.set_expanded(true, ctx);
+            self.move_selection(visible_items, 1);
+        }
+        if up {
+            self.set_expanded(true, ctx);
+            self.move_selection(visible_items, -1);
+        }
+        if right || space {
+            if let Some(index) = self.selected_index(visible_items) {
+                self.open_preview(&visible_items[index], ctx);
+            }
+        }
+        if star {
+            if let Some(index) = self.selected_index(visible_items) {
+                self.toggle_star(visible_items[index].id);
+            }
+        }
+        if ctx.input(|input| input.key_pressed(Key::O)) {
+            if let Some(index) = self.selected_index(visible_items) {
+                self.open_item(&visible_items[index], data_dir, ctx);
+            }
+        }
+        if ctx.input(|input| input.key_pressed(Key::C)) {
+            if let Some(index) = self.selected_index(visible_items) {
+                let item = &visible_items[index];
+                self.copy_item_and_hide(
+                    item,
+                    data_dir,
+                    ctx,
+                    &format!("Copied {}", item.kind.label().to_lowercase()),
+                );
+            }
+        }
+        if ctx.input(|input| input.key_pressed(Key::F)) {
+            if let Some(index) = self.selected_index(visible_items) {
+                if matches!(
+                    visible_items[index].kind,
+                    ClipKind::FilePath | ClipKind::Files
+                ) {
+                    self.reveal_file_in_finder(&visible_items[index], ctx);
+                }
+            }
+        }
+        if ctx.input(|input| input.key_pressed(Key::S)) {
+            if let Some(index) = self.selected_index(visible_items) {
+                self.share_item(&visible_items[index], data_dir);
+            }
+        }
+        if enter {
+            if let Some(index) = self.selected_index(visible_items) {
+                self.copy_and_paste_item(&visible_items[index], data_dir, ctx);
+            }
+        }
+    }
+
+    fn handle_scroll_intent(&mut self, ctx: &egui::Context, item_count: usize) {
+        if !self.window_visible || self.settings_open || self.permission_onboarding {
+            return;
+        }
+
+        let scrolled = ctx.input(|input| {
+            input.raw_scroll_delta.y.abs() > 0.0 || input.smooth_scroll_delta.y.abs() > 0.0
+        });
+        if !scrolled {
+            return;
+        }
+
+        self.scroll_selected_into_view = false;
+        if item_count > COMPACT_VISIBLE_ITEMS && !self.palette_expanded {
+            self.set_expanded(true, ctx);
+        }
+    }
+
+    fn show_settings(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.vertical(|ui| {
+            ui.label(RichText::new("Settings").strong().size(16.0));
+            ui.add_space(8.0);
+
+            ui.horizontal(|ui| {
+                ui.label("Theme");
+                let mut theme = self.settings.theme;
+                for option in [ThemeMode::Light, ThemeMode::Dark] {
+                    ui.selectable_value(&mut theme, option, option.label());
+                }
+                if theme != self.settings.theme {
+                    self.settings.theme = theme;
+                    apply_theme(ctx, theme);
+                    self.save_settings();
+                }
+            });
+
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label("History limit");
+                let mut limit = self.settings.history_limit;
+                let response = ui.add(
+                    egui::DragValue::new(&mut limit)
+                        .range(MIN_HISTORY_LIMIT..=MAX_HISTORY_LIMIT)
+                        .speed(1),
+                );
+                if response.changed() {
+                    self.set_history_limit(limit);
+                }
+            });
+
+            ui.add_space(8.0);
+            let mut launch_at_login = self.settings.launch_at_login;
+            if ui
+                .checkbox(&mut launch_at_login, "Run at login")
+                .on_hover_text("Start Better Clipboard when you log in to macOS")
+                .changed()
+            {
+                self.set_launch_at_login(launch_at_login);
+            }
+
+            ui.add_space(8.0);
+            let accessibility_status = if accessibility_permission_granted() {
+                "Accessibility permission granted"
+            } else {
+                "Accessibility permission needed for automatic paste"
+            };
+            ui.label(RichText::new(accessibility_status).color(muted_text(self.settings.theme)));
+            if !accessibility_permission_granted()
+                && ui.button("Request Accessibility Permission").clicked()
+            {
+                if request_accessibility_permission() {
+                    self.status = "Accessibility permission granted".to_owned();
+                } else {
+                    self.status = "Accessibility permission requested".to_owned();
+                }
+            }
+
+            ui.add_space(10.0);
+            ui.separator();
+            ui.label(RichText::new("Local API").strong());
+            let mut api_enabled = self.settings.api_enabled;
+            if ui
+                .checkbox(
+                    &mut api_enabled,
+                    format!(
+                        "Let local apps send items (127.0.0.1:{})",
+                        self.settings.api_port
+                    ),
+                )
+                .on_hover_text(
+                    "Other apps on this Mac can POST text to Better Clipboard with the token below",
+                )
+                .changed()
+            {
+                self.settings.api_enabled = api_enabled;
+                self.save_settings();
+                self.sync_api_server(ctx);
+            }
+            let muted = muted_text(self.settings.theme);
+            ui.label(RichText::new(&self.api_status).color(muted));
+            if self.settings.api_enabled {
+                let token = self
+                    .api_token
+                    .read()
+                    .map(|token| token.clone())
+                    .unwrap_or_default();
+                ui.horizontal(|ui| {
+                    ui.label("Token");
+                    ui.label(RichText::new(masked_token(&token)).monospace().color(muted));
+                    if ui
+                        .button("Copy")
+                        .on_hover_text("Copy the token without saving it to history")
+                        .clicked()
+                    {
+                        self.copy_api_token();
+                    }
+                    if ui
+                        .button("Regenerate")
+                        .on_hover_text("Issue a new token; clients using the old one stop working")
+                        .clicked()
+                    {
+                        self.regenerate_api_token();
+                    }
+                });
+            }
+            if !self.status.is_empty() {
+                ui.add_space(4.0);
+                ui.label(RichText::new(&self.status).color(muted));
+            }
+        });
+    }
+
+    fn show_permission_onboarding(&mut self, ctx: &egui::Context) {
+        if accessibility_permission_granted() {
+            self.permission_onboarding = false;
+            self.permission_prompt_after = None;
+            self.hide_window(ctx);
+            return;
+        }
+
+        if self.permission_prompt_after.is_none() && !self.permission_prompt_requested {
+            self.permission_prompt_after = Some(Instant::now() + PERMISSION_PROMPT_DELAY);
+            self.status =
+                "Better Clipboard will ask macOS for Accessibility permission.".to_owned();
+            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+                egui::WindowLevel::Normal,
+            ));
+            ctx.request_repaint_after(PERMISSION_PROMPT_DELAY);
+        }
+
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::NONE
+                    .fill(palette_background(self.settings.theme))
+                    .inner_margin(18),
+            )
+            .show(ctx, |ui| {
+                ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                    ui.label(RichText::new(APP_NAME).strong().size(18.0));
+                    ui.add_space(10.0);
+                    ui.label("Accessibility permission is needed to paste into the app you were using after choosing a clipboard item.");
+                    ui.add_space(6.0);
+                    ui.label("Better Clipboard will open the macOS permission prompt after this window is visible.");
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Request Now").clicked() {
+                            self.permission_prompt_after = None;
+                            self.permission_prompt_requested = true;
+                            if request_accessibility_permission() {
+                                self.permission_onboarding = false;
+                                self.hide_window(ctx);
+                            } else {
+                                self.status =
+                                    "Accessibility permission requested in System Settings"
+                                        .to_owned();
+                            }
+                        }
+                        if ui.button("Check Again").clicked() && accessibility_permission_granted()
+                        {
+                            self.permission_onboarding = false;
+                            self.hide_window(ctx);
+                        }
+                        if ui.button("Not Now").clicked() {
+                            self.hide_window(ctx);
+                        }
+                    });
+                    ui.add_space(10.0);
+                    ui.label(RichText::new(&self.status).color(muted_text(self.settings.theme)));
+                });
+            });
+
+        if self
+            .permission_prompt_after
+            .is_some_and(|prompt_at| Instant::now() >= prompt_at)
+        {
+            self.permission_prompt_after = None;
+            self.permission_prompt_requested = true;
+            self.status = "Opening macOS Accessibility permission prompt.".to_owned();
+            if request_accessibility_permission() {
+                self.permission_onboarding = false;
+                self.hide_window(ctx);
+            } else {
+                self.status =
+                    "Permission requested. Allow Better Clipboard in System Settings, then click Check Again."
+                        .to_owned();
+                ctx.request_repaint_after(Duration::from_millis(500));
+            }
+        }
+    }
+}
+
+impl eframe::App for BetterClipboardApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.handle_app_events(ctx);
+
+        if ctx.input(|input| input.viewport().close_requested()) && !self.force_quit {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.hide_window(ctx);
+            return;
+        }
+
+        if self.last_repaint.elapsed() > Duration::from_millis(500) {
+            ctx.request_repaint();
+            self.last_repaint = Instant::now();
+        }
+
+        if self.permission_onboarding {
+            self.show_permission_onboarding(ctx);
+            return;
+        }
+
+        let (data_dir, items) = match self.store.lock() {
+            Ok(store) => (store.data_dir.clone(), store.items.clone()),
+            Err(_) => {
+                self.status = "History is temporarily unavailable".to_owned();
+                return;
+            }
+        };
+
+        let query = (self.search_active && !self.search_query.is_empty())
+            .then(|| self.search_query.to_lowercase());
+        let visible_items: Vec<ClipItem> = items
+            .into_iter()
+            .filter(|item| !self.starred_only || item.starred)
+            .filter(|item| {
+                query
+                    .as_deref()
+                    .is_none_or(|query| item.matches_query(query))
+            })
+            .collect();
+        self.ensure_selection(&visible_items);
+        self.handle_keyboard(ctx, &visible_items, &data_dir);
+        self.handle_scroll_intent(ctx, visible_items.len());
+        let display_items: Vec<ClipItem> = if self.settings_open {
+            Vec::new()
+        } else if self.palette_expanded {
+            visible_items.clone()
+        } else {
+            visible_items
+                .iter()
+                .take(COMPACT_VISIBLE_ITEMS)
+                .cloned()
+                .collect()
+        };
+        let bg = palette_background(self.settings.theme);
+        let row_bg = row_background(self.settings.theme);
+        let selected_bg = selected_row_background(self.settings.theme);
+        let muted = muted_text(self.settings.theme);
+        let shown_count = display_items.len();
+
+        if !self.settings_open {
+            let selected_item = self
+                .selected_index(&visible_items)
+                .map(|index| &visible_items[index]);
+            let hints = shortcut_hints(selected_item, self.search_active);
+            egui::TopBottomPanel::bottom("shortcut_hints")
+                .frame(
+                    egui::Frame::NONE
+                        .fill(bg)
+                        .inner_margin(egui::Margin::symmetric(14, 6)),
+                )
+                .show_separator_line(false)
+                .show(ctx, |ui| show_shortcut_hints(ui, &hints, muted));
+        }
+
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE.fill(bg).inner_margin(14))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("📋").size(22.0));
+                    ui.label(RichText::new(APP_NAME).strong().size(18.0));
+                    ui.separator();
+                    let count_text = if self.search_active && !self.search_query.is_empty() {
+                        format!(
+                            "{} match{}",
+                            visible_items.len(),
+                            if visible_items.len() == 1 { "" } else { "es" }
+                        )
+                    } else if self.starred_only {
+                        format!("{} starred", visible_items.len())
+                    } else if self.palette_expanded {
+                        format!("{} items", visible_items.len())
+                    } else if visible_items.is_empty() {
+                        "0 items".to_owned()
+                    } else {
+                        format!("Showing {} of {}", shown_count, visible_items.len())
+                    };
+                    ui.label(RichText::new(count_text).color(muted));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("×").on_hover_text("Close").clicked() {
+                            self.hide_window(ctx);
+                        }
+                        if ui.button("⚙").on_hover_text("Settings").clicked() {
+                            self.settings_open = !self.settings_open;
+                            self.resize_palette(ctx);
+                        }
+                        let star_filter = RichText::new("★").color(if self.starred_only {
+                            star_color()
+                        } else {
+                            muted
+                        });
+                        if ui
+                            .button(star_filter)
+                            .on_hover_text(if self.starred_only {
+                                "Show all items"
+                            } else {
+                                "Show starred items only"
+                            })
+                            .clicked()
+                        {
+                            self.starred_only = !self.starred_only;
+                            self.select_first_on_show = true;
+                        }
+                        let expand_label = if self.palette_expanded { "⌃" } else { "⌄" };
+                        if ui
+                            .button(expand_label)
+                            .on_hover_text(if self.palette_expanded {
+                                "Collapse"
+                            } else {
+                                "Expand"
+                            })
+                            .clicked()
+                        {
+                            self.set_expanded(!self.palette_expanded, ctx);
+                        }
+                    });
+                });
+
+                ui.add_space(8.0);
+                if self.settings_open {
+                    self.show_settings(ui, ctx);
+                    return;
+                }
+
+                // Search bar — shown when / has been pressed
+                if self.search_active {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("🔍").size(13.0).color(muted));
+                        let search_field = egui::TextEdit::singleline(&mut self.search_query)
+                            .hint_text("Search history…")
+                            .desired_width(f32::INFINITY)
+                            .frame(false);
+                        let response = ui.add(search_field);
+                        // Request focus only on the first frame after search is activated
+                        if self.search_focus_requested {
+                            response.request_focus();
+                            self.search_focus_requested = false;
+                        }
+                        if response.changed() {
+                            self.select_first_on_show = true;
+                        }
+                        if !self.search_query.is_empty()
+                            && ui
+                                .small_button(RichText::new("×").color(muted))
+                                .on_hover_text("Clear search (Esc)")
+                                .clicked()
+                        {
+                            self.search_query.clear();
+                            self.select_first_on_show = true;
+                        }
+                    });
+                    ui.add(egui::Separator::default().spacing(4.0));
+                }
+
+                if visible_items.is_empty() {
+                    ui.centered_and_justified(|ui| {
+                        if self.search_active && !self.search_query.is_empty() {
+                            ui.label(format!("No matches for \"{}\"", self.search_query));
+                        } else if self.starred_only {
+                            ui.label(
+                                "No starred items yet. Select an item and press 8 to star it.",
+                            );
+                        } else {
+                            ui.label("Copy text, a URL, or an image to start building history.");
+                        }
+                    });
+                    return;
+                }
+
+                let mut did_scroll_selected = false;
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for item in display_items {
+                        let selected = self.selected == Some(item.id);
+                        let fill = if selected { selected_bg } else { row_bg };
+                        let row_width = ui.available_width();
+                        let mut row_action = None;
+                        let row_size = egui::vec2(row_width, ROW_HEIGHT + 20.0);
+                        let (row_rect, response) =
+                            ui.allocate_exact_size(row_size, egui::Sense::click());
+                        ui.painter()
+                            .rect_filled(row_rect, CornerRadius::same(3), fill);
+                        ui.painter().rect_stroke(
+                            row_rect,
+                            CornerRadius::same(3),
+                            Stroke::new(1.0, hint_chip_stroke(self.settings.theme)),
+                            egui::StrokeKind::Inside,
+                        );
+
+                        let inner_rect = row_rect.shrink(10.0);
+                        ui.scope_builder(egui::UiBuilder::new().max_rect(inner_rect), |ui| {
+                            ui.set_min_size(inner_rect.size());
+                            ui.horizontal_top(|ui| {
+                                let action_response = show_item_action_button(
+                                    ui,
+                                    ctx,
+                                    &mut self.textures,
+                                    &data_dir,
+                                    &item,
+                                    self.settings.theme,
+                                );
+                                if action_response.clicked() {
+                                    self.run_item_action(&item, &data_dir, ctx);
+                                    ctx.request_repaint();
+                                }
+                                ui.add_space(8.0);
+                                let content_width = ui.available_width();
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(content_width, ROW_HEIGHT),
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| {
+                                        ui.spacing_mut().item_spacing.y = 2.0;
+                                        let text_color = if selected {
+                                            selected_text(self.settings.theme)
+                                        } else {
+                                            ui.visuals().text_color()
+                                        };
+                                        paint_row_summary(
+                                            ui,
+                                            &item.summary,
+                                            text_color,
+                                            content_width,
+                                        );
+                                        ui.allocate_ui_with_layout(
+                                            egui::vec2(content_width, HINT_CHIP_HEIGHT),
+                                            egui::Layout::left_to_right(egui::Align::Center),
+                                            |ui| {
+                                                let actions_width = row_action_buttons_width(&item);
+                                                let star_response =
+                                                    show_star_toggle(ui, item.starred, muted);
+                                                if star_response.clicked() {
+                                                    row_action = Some(RowAction::Star);
+                                                }
+                                                let metadata_width = (content_width
+                                                    - actions_width
+                                                    - star_response.rect.width()
+                                                    - 16.0)
+                                                    .max(0.0);
+                                                ui.add_sized(
+                                                    egui::vec2(metadata_width, HINT_CHIP_HEIGHT),
+                                                    egui::Label::new(
+                                                        RichText::new(item.metadata_line())
+                                                            .color(muted),
+                                                    )
+                                                    .truncate()
+                                                    .halign(egui::Align::Min),
+                                                );
+                                                ui.with_layout(
+                                                    egui::Layout::right_to_left(
+                                                        egui::Align::Center,
+                                                    ),
+                                                    |ui| {
+                                                        if let Some(action) =
+                                                            show_row_action_buttons(
+                                                                ui,
+                                                                &item,
+                                                                self.settings.theme,
+                                                            )
+                                                        {
+                                                            row_action = Some(action);
+                                                        }
+                                                    },
+                                                );
+                                            },
+                                        );
+                                    },
+                                );
+                            });
+                        });
+
+                        if let Some(action) = row_action {
+                            self.selected = Some(item.id);
+                            self.run_row_action(action, &item, &data_dir, ctx);
+                            ctx.request_repaint();
+                        } else {
+                            if response.clicked() {
+                                self.selected = Some(item.id);
+                            }
+
+                            if response.double_clicked() {
+                                self.copy_and_paste_item(&item, &data_dir, ctx);
+                            }
+                        }
+
+                        if selected && self.scroll_selected_into_view {
+                            response.scroll_to_me(Some(egui::Align::Center));
+                            did_scroll_selected = true;
+                        }
+                        ui.add_space(6.0);
+                    }
+                });
+                if did_scroll_selected {
+                    self.scroll_selected_into_view = false;
+                }
+            });
+
+        self.show_preview(ctx, &data_dir, &visible_items);
+        self.handle_focus_loss(ctx);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreviewAction {
+    None,
+    Close,
+    Paste,
+    Copy,
+}
+
+impl BetterClipboardApp {
+    fn show_preview(&mut self, ctx: &egui::Context, data_dir: &Path, items: &[ClipItem]) {
+        let Some(preview) = self.preview_item else {
+            return;
+        };
+        let Some(item) = items
+            .iter()
+            .find(|item| item.id == preview.item_id)
+            .cloned()
+        else {
+            self.close_preview(ctx);
+            return;
+        };
+        let Some(image) = item.image.clone() else {
+            if item.has_viewable_text() {
+                self.show_text_preview(ctx, data_dir, &item);
+            } else {
+                self.close_preview(ctx);
+            }
+            return;
+        };
+
+        let image_size = preview_image_size(ctx, image.width, image.height);
+        let window_size = image_size;
+
+        if !self.textures.contains_key(&item.id) {
+            if let Ok(color_image) = load_color_image(&data_dir.join(&image.path)) {
+                let texture = ctx.load_texture(
+                    item.id.to_string(),
+                    color_image,
+                    egui::TextureOptions::LINEAR,
+                );
+                self.textures.insert(item.id, texture);
+            }
+        }
+        let texture = self.textures.get(&item.id).cloned();
+        let theme = self.settings.theme;
+        let builder = image_preview_viewport_builder(ctx, window_size);
+
+        let action = ctx.show_viewport_immediate(preview_viewport_id(), builder, |ctx, _| {
+            apply_theme(ctx, theme);
+            let mut result = PreviewAction::None;
+
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE.fill(Color32::TRANSPARENT).inner_margin(0))
+                .show(ctx, |ui| {
+                    if let Some(texture) = &texture {
+                        let (rect, _) = ui.allocate_exact_size(image_size, egui::Sense::hover());
+                        ui.painter().image(
+                            texture.id(),
+                            rect,
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                            Color32::WHITE,
+                        );
+                    } else {
+                        ui.centered_and_justified(|ui| {
+                            ui.label("Preview unavailable");
+                        });
+                    }
+                });
+
+            let close_clicked = egui::Area::new(egui::Id::new("preview_close"))
+                .fixed_pos(egui::pos2(image_size.x - 82.0, 10.0))
+                .show(ctx, |ui| {
+                    let (rect, response) =
+                        ui.allocate_exact_size(egui::vec2(74.0, 26.0), egui::Sense::click());
+                    let bg = if response.hovered() {
+                        Color32::from_rgba_unmultiplied(50, 50, 50, 220)
+                    } else {
+                        Color32::from_rgba_unmultiplied(20, 20, 20, 180)
+                    };
+                    ui.painter().rect_filled(rect, CornerRadius::same(5), bg);
+                    ui.painter().text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "✕  Esc",
+                        egui::FontId::proportional(11.0),
+                        Color32::WHITE,
+                    );
+                    response.clicked()
+                })
+                .inner;
+
+            if close_clicked
+                || ctx.input(|input| input.viewport().close_requested())
+                || ctx.input(|input| input.key_pressed(Key::Escape))
+                || ctx.input(|input| input.key_pressed(Key::ArrowLeft))
+                || ctx.input(|input| input.key_pressed(Key::Space))
+            {
+                result = PreviewAction::Close;
+            }
+            if ctx.input(|input| input.key_pressed(Key::Enter)) {
+                result = PreviewAction::Paste;
+            }
+            if ctx.input(|input| input.key_pressed(Key::C) && !input.modifiers.command) {
+                result = PreviewAction::Copy;
+            }
+
+            result
+        });
+
+        match action {
+            PreviewAction::None => {}
+            PreviewAction::Close => self.close_preview(ctx),
+            PreviewAction::Paste => self.copy_and_paste_item(&item, data_dir, ctx),
+            PreviewAction::Copy => self.copy_item_and_hide(
+                &item,
+                data_dir,
+                ctx,
+                &format!("Copied {}", item.kind.label().to_lowercase()),
+            ),
+        }
+    }
+}
+
+impl BetterClipboardApp {
+    /// Full-text viewer, for checking long items (e.g. dictation) before pasting.
+    fn show_text_preview(&mut self, ctx: &egui::Context, data_dir: &Path, item: &ClipItem) {
+        let text = item.text.clone().unwrap_or_default();
+        let size = text_viewer_size(ctx);
+        let theme = self.settings.theme;
+        let mut builder = egui::ViewportBuilder::default()
+            .with_inner_size(size)
+            .with_resizable(false)
+            .with_decorations(false)
+            .with_always_on_top()
+            .with_active(true)
+            .with_title("Better Clipboard Text Viewer");
+        if let Some(position) = image_preview_position(ctx, size) {
+            builder = builder.with_position(position);
+        }
+
+        let action = ctx.show_viewport_immediate(preview_viewport_id(), builder, |ctx, _| {
+            apply_theme(ctx, theme);
+            let muted = muted_text(theme);
+            let mut result = PreviewAction::None;
+            let mut text_focused = false;
+
+            egui::TopBottomPanel::top("text_viewer_header")
+                .frame(
+                    egui::Frame::NONE
+                        .fill(palette_background(theme))
+                        .inner_margin(egui::Margin::symmetric(16, 10)),
+                )
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(item.metadata_line()).color(muted));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("✕  Esc").on_hover_text("Close").clicked() {
+                                result = PreviewAction::Close;
+                            }
+                            ui.label(RichText::new(text_stats(&text)).color(muted));
+                        });
+                    });
+                });
+            egui::TopBottomPanel::bottom("text_viewer_footer")
+                .frame(
+                    egui::Frame::NONE
+                        .fill(palette_background(theme))
+                        .inner_margin(egui::Margin::symmetric(16, 8)),
+                )
+                .show(ctx, |ui| {
+                    show_shortcut_hints(
+                        ui,
+                        &[
+                            ("Enter", "Paste"),
+                            ("C", "Copy all"),
+                            ("⌘C", "Copy selection"),
+                            ("Esc", "Close"),
+                        ],
+                        muted,
+                    );
+                });
+            egui::CentralPanel::default()
+                .frame(
+                    egui::Frame::NONE
+                        .fill(row_background(theme))
+                        .inner_margin(16),
+                )
+                .show(ctx, |ui| {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink(false)
+                        .show(ui, |ui| {
+                            // A &str buffer is selectable but read-only.
+                            let response = ui.add(
+                                egui::TextEdit::multiline(&mut text.as_str())
+                                    .desired_width(f32::INFINITY)
+                                    .frame(false)
+                                    .font(egui::FontId::proportional(15.0)),
+                            );
+                            text_focused = response.has_focus();
+                        });
+                });
+
+            let (escape, left, space, enter, copy) = ctx.input(|input| {
+                (
+                    input.key_pressed(Key::Escape),
+                    input.key_pressed(Key::ArrowLeft),
+                    input.key_pressed(Key::Space),
+                    input.key_pressed(Key::Enter),
+                    input.key_pressed(Key::C) && !input.modifiers.command,
+                )
+            });
+            // Arrow keys and Space move the cursor once the text is clicked into.
+            if escape
+                || ctx.input(|input| input.viewport().close_requested())
+                || (!text_focused && (left || space))
+            {
+                result = PreviewAction::Close;
+            } else if enter {
+                result = PreviewAction::Paste;
+            } else if copy {
+                result = PreviewAction::Copy;
+            }
+            result
+        });
+
+        match action {
+            PreviewAction::None => {}
+            PreviewAction::Close => self.close_preview(ctx),
+            PreviewAction::Paste => self.copy_and_paste_item(item, data_dir, ctx),
+            PreviewAction::Copy => self.copy_item_and_hide(
+                item,
+                data_dir,
+                ctx,
+                &format!("Copied {}", item.kind.label().to_lowercase()),
+            ),
+        }
+    }
+}
+
+fn text_viewer_size(ctx: &egui::Context) -> egui::Vec2 {
+    let preferred = egui::Vec2::from(TEXT_VIEWER_SIZE);
+    ctx.input(|input| input.viewport().monitor_size)
+        .map(|monitor| {
+            egui::vec2(
+                preferred.x.min(monitor.x - 80.0),
+                preferred.y.min(monitor.y - 120.0),
+            )
+        })
+        .unwrap_or(preferred)
+}
+
+fn text_stats(text: &str) -> String {
+    let words = text.split_whitespace().count();
+    let chars = text.chars().count();
+    format!(
+        "{words} word{} · {chars} character{}",
+        if words == 1 { "" } else { "s" },
+        if chars == 1 { "" } else { "s" }
+    )
+}
+
+fn masked_token(token: &str) -> String {
+    if token.len() < 8 {
+        return "—".to_owned();
+    }
+    format!("{}…{}", &token[..3], last_chars(token, 4))
+}
+
+fn palette_background(theme: ThemeMode) -> Color32 {
+    match theme {
+        ThemeMode::Light => Color32::from_rgb(246, 246, 244),
+        ThemeMode::Dark => Color32::from_rgb(18, 18, 18),
+    }
+}
+
+fn preview_viewport_id() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of("better-clipboard-image-preview")
+}
+
+fn image_preview_viewport_builder(ctx: &egui::Context, size: egui::Vec2) -> egui::ViewportBuilder {
+    let mut builder = egui::ViewportBuilder::default()
+        .with_inner_size(size)
+        .with_min_inner_size(size)
+        .with_max_inner_size(size)
+        .with_resizable(false)
+        .with_decorations(false)
+        .with_transparent(true)
+        .with_always_on_top()
+        .with_active(true)
+        .with_title("Better Clipboard Image Preview");
+
+    if let Some(position) = image_preview_position(ctx, size) {
+        builder = builder.with_position(position);
+    }
+
+    builder
+}
+
+fn image_preview_position(ctx: &egui::Context, size: egui::Vec2) -> Option<egui::Pos2> {
+    const SCREEN_MARGIN: f32 = 8.0;
+
+    ctx.input(|input| {
+        let monitor_size = input.viewport().monitor_size?;
+        let x = ((monitor_size.x - size.x) * 0.5).max(SCREEN_MARGIN);
+        let y = ((monitor_size.y - size.y) * 0.5).max(SCREEN_MARGIN);
+        Some(egui::pos2(x, y))
+    })
+}
+
+fn preview_image_size(ctx: &egui::Context, width: usize, height: usize) -> egui::Vec2 {
+    let width = width.max(1) as f32;
+    let height = height.max(1) as f32;
+    let pixels_per_point = ctx.pixels_per_point().max(1.0);
+    let native_size = egui::vec2(width / pixels_per_point, height / pixels_per_point);
+    let scaled = native_size * PREVIEW_SCALE;
+    let cap_scale = (PREVIEW_MAX_IMAGE_WIDTH / scaled.x)
+        .min(PREVIEW_MAX_IMAGE_HEIGHT / scaled.y)
+        .min(1.0);
+    scaled * cap_scale
+}
+
+fn better_clipboard_has_focus(ctx: &egui::Context) -> bool {
+    ctx.input(|input| {
+        let root_focused = input.viewport().focused.unwrap_or(input.focused);
+        let preview_focused = input
+            .raw
+            .viewports
+            .get(&preview_viewport_id())
+            .and_then(|viewport| viewport.focused)
+            .unwrap_or(false);
+        root_focused || preview_focused
+    })
+}
+
+fn row_background(theme: ThemeMode) -> Color32 {
+    match theme {
+        ThemeMode::Light => Color32::from_rgb(255, 255, 255),
+        ThemeMode::Dark => Color32::from_rgb(28, 28, 28),
+    }
+}
+
+fn selected_row_background(theme: ThemeMode) -> Color32 {
+    match theme {
+        ThemeMode::Light => Color32::from_rgb(224, 237, 255),
+        ThemeMode::Dark => Color32::from_rgb(38, 57, 72),
+    }
+}
+
+fn selected_text(theme: ThemeMode) -> Color32 {
+    match theme {
+        ThemeMode::Light => Color32::from_rgb(26, 60, 110),
+        ThemeMode::Dark => Color32::from_rgb(170, 210, 255),
+    }
+}
+
+fn paint_row_summary(ui: &mut egui::Ui, summary: &str, color: Color32, width: f32) {
+    let size = egui::vec2(width, TEXT_PREVIEW_HEIGHT);
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let font_id = egui::TextStyle::Body.resolve(ui.style());
+    let galley = ui
+        .painter()
+        .layout(summary.to_owned(), font_id, color, rect.width());
+    ui.painter()
+        .with_clip_rect(rect)
+        .galley(rect.left_top(), galley, color);
+}
+
+fn muted_text(theme: ThemeMode) -> Color32 {
+    match theme {
+        ThemeMode::Light => Color32::from_rgb(95, 95, 95),
+        ThemeMode::Dark => Color32::from_rgb(155, 155, 155),
+    }
+}
+
+fn thumbnail_background(theme: ThemeMode) -> Color32 {
+    match theme {
+        ThemeMode::Light => Color32::from_rgb(234, 234, 232),
+        ThemeMode::Dark => Color32::from_rgb(46, 46, 46),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowAction {
+    Paste,
+    Copy,
+    Open,
+    Reveal,
+    Preview,
+    Share,
+    Star,
+}
+
+fn show_row_action_buttons(
+    ui: &mut egui::Ui,
+    item: &ClipItem,
+    theme: ThemeMode,
+) -> Option<RowAction> {
+    let kind = item.kind;
+    ui.spacing_mut().item_spacing.x = HINT_CHIP_GAP;
+    let mut action = None;
+
+    if show_row_action_button(
+        ui,
+        ActionIcon::Share,
+        "Share",
+        "S",
+        "Open macOS share sheet",
+        theme,
+    )
+    .clicked()
+    {
+        action = Some(RowAction::Share);
+    }
+
+    match kind {
+        ClipKind::Text | ClipKind::OneTimeCode => {
+            if show_row_action_button(
+                ui,
+                ActionIcon::Copy,
+                "Copy",
+                "C",
+                "Copy without pasting",
+                theme,
+            )
+            .clicked()
+            {
+                action = Some(RowAction::Copy);
+            }
+            if show_row_action_button(
+                ui,
+                ActionIcon::Preview,
+                "View",
+                "Space",
+                "View the full text",
+                theme,
+            )
+            .clicked()
+            {
+                action = Some(RowAction::Preview);
+            }
+        }
+        ClipKind::Url => {
+            if show_row_action_button(ui, ActionIcon::Open, "Open", "O", "Open URL", theme)
+                .clicked()
+            {
+                action = Some(RowAction::Open);
+            }
+        }
+        ClipKind::FilePath => {
+            if show_row_action_button(
+                ui,
+                ActionIcon::Finder,
+                "Finder",
+                "F",
+                "Reveal in Finder",
+                theme,
+            )
+            .clicked()
+            {
+                action = Some(RowAction::Reveal);
+            }
+            if show_row_action_button(ui, ActionIcon::Open, "Open", "O", "Open file", theme)
+                .clicked()
+            {
+                action = Some(RowAction::Open);
+            }
+        }
+        ClipKind::Files => {
+            if show_row_action_button(
+                ui,
+                ActionIcon::Finder,
+                "Finder",
+                "F",
+                "Reveal in Finder",
+                theme,
+            )
+            .clicked()
+            {
+                action = Some(RowAction::Reveal);
+            }
+            if show_row_action_button(ui, ActionIcon::Open, "Open", "O", "Open files", theme)
+                .clicked()
+            {
+                action = Some(RowAction::Open);
+            }
+        }
+        ClipKind::Email => {
+            if show_row_action_button(ui, ActionIcon::Email, "Email", "O", "Compose email", theme)
+                .clicked()
+            {
+                action = Some(RowAction::Open);
+            }
+        }
+        ClipKind::Phone => {
+            if show_row_action_button(
+                ui,
+                ActionIcon::Phone,
+                "Call",
+                "O",
+                "Open phone handler",
+                theme,
+            )
+            .clicked()
+            {
+                action = Some(RowAction::Open);
+            }
+        }
+        ClipKind::Image => {
+            if show_row_action_button(
+                ui,
+                ActionIcon::Preview,
+                "Preview",
+                "Space",
+                "Preview image",
+                theme,
+            )
+            .clicked()
+            {
+                action = Some(RowAction::Preview);
+            }
+        }
+    }
+
+    if show_row_action_button(
+        ui,
+        ActionIcon::Paste,
+        "Paste",
+        "Enter",
+        "Paste into the previous app",
+        theme,
+    )
+    .clicked()
+    {
+        action = Some(RowAction::Paste);
+    }
+
+    action
+}
+
+fn row_action_buttons_width(item: &ClipItem) -> f32 {
+    let count = row_action_button_count(item.kind) as f32;
+    (count * HINT_CHIP_WIDTH) + ((count - 1.0).max(0.0) * HINT_CHIP_GAP)
+}
+
+fn row_action_button_count(kind: ClipKind) -> usize {
+    let paste = 1;
+    let share = 1;
+    let type_specific = match kind {
+        ClipKind::Url | ClipKind::Email | ClipKind::Phone | ClipKind::Image => 1,
+        ClipKind::Text | ClipKind::OneTimeCode | ClipKind::FilePath | ClipKind::Files => 2,
+    };
+    paste + share + type_specific
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActionIcon {
+    Copy,
+    Open,
+    Finder,
+    Email,
+    Phone,
+    Preview,
+    Paste,
+    Share,
+}
+
+fn show_row_action_button(
+    ui: &mut egui::Ui,
+    icon: ActionIcon,
+    label: &str,
+    shortcut: &str,
+    hover_text: &str,
+    theme: ThemeMode,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(HINT_CHIP_WIDTH, HINT_CHIP_HEIGHT),
+        egui::Sense::click(),
+    );
+    let fill = if response.hovered() {
+        hint_chip_hover_background(theme)
+    } else {
+        hint_chip_background(theme)
+    };
+    ui.painter().rect_filled(rect, CornerRadius::same(5), fill);
+    ui.painter().rect_stroke(
+        rect,
+        CornerRadius::same(5),
+        Stroke::new(1.0, hint_chip_stroke(theme)),
+        egui::StrokeKind::Inside,
+    );
+    let icon_rect = egui::Rect::from_center_size(
+        egui::pos2(rect.center().x, rect.top() + 12.0),
+        egui::vec2(14.0, 14.0),
+    );
+    draw_action_icon(ui.painter(), icon_rect, icon, muted_text(theme), 1.4);
+    ui.painter().text(
+        egui::pos2(rect.center().x, rect.top() + 28.0),
+        egui::Align2::CENTER_CENTER,
+        label,
+        egui::FontId::proportional(10.0),
+        muted_text(theme),
+    );
+    ui.painter().text(
+        egui::pos2(rect.center().x, rect.bottom() - 7.0),
+        egui::Align2::CENTER_CENTER,
+        shortcut,
+        egui::FontId {
+            size: 8.5,
+            ..Default::default()
+        },
+        muted_text(theme),
+    );
+    response.on_hover_text(hover_text)
+}
+
+fn show_star_toggle(ui: &mut egui::Ui, starred: bool, muted: Color32) -> egui::Response {
+    let color = if starred {
+        star_color()
+    } else {
+        muted.gamma_multiply(0.5)
+    };
+    ui.add(
+        egui::Button::new(RichText::new("★").size(14.0).color(color))
+            .frame(false)
+            .min_size(egui::vec2(18.0, HINT_CHIP_HEIGHT)),
+    )
+    .on_hover_text(if starred { "Unstar (8)" } else { "Star (8)" })
+}
+
+fn star_color() -> Color32 {
+    Color32::from_rgb(232, 176, 36)
+}
+
+/// Keys that act on the current selection, shown in the footer so they're discoverable.
+fn shortcut_hints(
+    selected: Option<&ClipItem>,
+    search_active: bool,
+) -> Vec<(&'static str, &'static str)> {
+    if search_active {
+        return vec![
+            ("↑↓", "Select"),
+            ("Enter", "Paste"),
+            ("Esc", "Clear / close"),
+        ];
+    }
+    let Some(item) = selected else {
+        return vec![("/", "Search"), ("Esc", "Close")];
+    };
+
+    let mut hints = vec![("Enter", "Paste"), ("C", "Copy")];
+    if item.kind == ClipKind::Image || item.has_viewable_text() {
+        hints.push(("Space", "View"));
+    }
+    match item.kind {
+        ClipKind::Url => hints.push(("O", "Open")),
+        ClipKind::Email => hints.push(("O", "Email")),
+        ClipKind::Phone => hints.push(("O", "Call")),
+        ClipKind::FilePath | ClipKind::Files => {
+            hints.push(("O", "Open"));
+            hints.push(("F", "Finder"));
+        }
+        ClipKind::Text | ClipKind::OneTimeCode | ClipKind::Image => {}
+    }
+    hints.push(("S", "Share"));
+    hints.push(("8", if item.starred { "Unstar" } else { "Star" }));
+    hints.push(("/", "Search"));
+    hints.push(("Esc", "Close"));
+    hints
+}
+
+fn show_shortcut_hints(ui: &mut egui::Ui, hints: &[(&str, &str)], muted: Color32) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        for (index, (key, description)) in hints.iter().enumerate() {
+            if index > 0 {
+                ui.add_space(6.0);
+            }
+            ui.label(
+                RichText::new(*key)
+                    .strong()
+                    .size(11.0)
+                    .color(ui.visuals().text_color()),
+            );
+            ui.label(RichText::new(*description).size(11.0).color(muted));
+        }
+    });
+}
+
+fn hint_chip_background(theme: ThemeMode) -> Color32 {
+    match theme {
+        ThemeMode::Light => Color32::from_rgb(248, 248, 246),
+        ThemeMode::Dark => Color32::from_rgb(30, 30, 30),
+    }
+}
+
+fn hint_chip_hover_background(theme: ThemeMode) -> Color32 {
+    match theme {
+        ThemeMode::Light => Color32::from_rgb(238, 238, 235),
+        ThemeMode::Dark => Color32::from_rgb(42, 42, 42),
+    }
+}
+
+fn hint_chip_stroke(theme: ThemeMode) -> Color32 {
+    match theme {
+        ThemeMode::Light => Color32::from_rgb(205, 205, 202),
+        ThemeMode::Dark => Color32::from_rgb(70, 70, 70),
+    }
+}
+
+fn draw_action_icon(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    icon: ActionIcon,
+    color: Color32,
+    stroke_width: f32,
+) {
+    let stroke = Stroke::new(stroke_width, color);
+    match icon {
+        ActionIcon::Copy => {
+            let back = egui::Rect::from_min_size(
+                rect.left_top() + egui::vec2(rect.width() * 0.24, 0.0),
+                rect.size() * 0.62,
+            );
+            let front = egui::Rect::from_min_size(
+                rect.left_top() + egui::vec2(0.0, rect.height() * 0.22),
+                rect.size() * 0.68,
+            );
+            painter.rect_stroke(
+                back,
+                CornerRadius::same(2),
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            painter.rect_stroke(
+                front,
+                CornerRadius::same(2),
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+        }
+        ActionIcon::Open => {
+            let start = egui::pos2(
+                rect.left() + rect.width() * 0.22,
+                rect.bottom() - rect.height() * 0.22,
+            );
+            let end = egui::pos2(
+                rect.right() - rect.width() * 0.18,
+                rect.top() + rect.height() * 0.18,
+            );
+            painter.line_segment([start, end], stroke);
+            painter.line_segment(
+                [
+                    end,
+                    egui::pos2(end.x - rect.width() * 0.38, end.y + rect.height() * 0.02),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    end,
+                    egui::pos2(end.x - rect.width() * 0.02, end.y + rect.height() * 0.38),
+                ],
+                stroke,
+            );
+        }
+        ActionIcon::Finder => {
+            let tab_left = egui::pos2(rect.left(), rect.top() + rect.height() * 0.34);
+            let tab_top = egui::pos2(
+                rect.left() + rect.width() * 0.28,
+                rect.top() + rect.height() * 0.18,
+            );
+            let tab_right = egui::pos2(
+                rect.left() + rect.width() * 0.48,
+                rect.top() + rect.height() * 0.34,
+            );
+            let points = [
+                tab_left,
+                tab_top,
+                tab_right,
+                egui::pos2(rect.right(), rect.top() + rect.height() * 0.34),
+                rect.right_bottom(),
+                rect.left_bottom(),
+                tab_left,
+            ];
+            for pair in points.windows(2) {
+                painter.line_segment([pair[0], pair[1]], stroke);
+            }
+        }
+        ActionIcon::Email => {
+            painter.rect_stroke(
+                rect,
+                CornerRadius::same(2),
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            painter.line_segment([rect.left_top(), rect.center()], stroke);
+            painter.line_segment([rect.right_top(), rect.center()], stroke);
+            painter.line_segment([rect.left_bottom(), rect.center()], stroke);
+            painter.line_segment([rect.right_bottom(), rect.center()], stroke);
+        }
+        ActionIcon::Phone => {
+            let points = [
+                egui::pos2(
+                    rect.left() + rect.width() * 0.18,
+                    rect.top() + rect.height() * 0.28,
+                ),
+                egui::pos2(
+                    rect.left() + rect.width() * 0.34,
+                    rect.top() + rect.height() * 0.18,
+                ),
+                egui::pos2(
+                    rect.left() + rect.width() * 0.48,
+                    rect.top() + rect.height() * 0.40,
+                ),
+                egui::pos2(
+                    rect.left() + rect.width() * 0.60,
+                    rect.top() + rect.height() * 0.54,
+                ),
+                egui::pos2(
+                    rect.left() + rect.width() * 0.82,
+                    rect.top() + rect.height() * 0.66,
+                ),
+                egui::pos2(
+                    rect.left() + rect.width() * 0.70,
+                    rect.top() + rect.height() * 0.84,
+                ),
+            ];
+            for pair in points.windows(2) {
+                painter.line_segment([pair[0], pair[1]], stroke);
+            }
+        }
+        ActionIcon::Preview => {
+            let radius = rect.width().min(rect.height()) * 0.28;
+            let center = rect.center() - egui::vec2(rect.width() * 0.08, rect.height() * 0.08);
+            painter.circle_stroke(center, radius, stroke);
+            painter.line_segment(
+                [
+                    center + egui::vec2(radius * 0.72, radius * 0.72),
+                    rect.right_bottom(),
+                ],
+                stroke,
+            );
+        }
+        ActionIcon::Paste => {
+            let top = egui::pos2(
+                rect.right() - rect.width() * 0.16,
+                rect.top() + rect.height() * 0.18,
+            );
+            let mid = egui::pos2(top.x, rect.center().y);
+            let left = egui::pos2(rect.left() + rect.width() * 0.22, mid.y);
+            painter.line_segment([top, mid], stroke);
+            painter.line_segment([mid, left], stroke);
+            painter.line_segment(
+                [
+                    left,
+                    left + egui::vec2(rect.width() * 0.22, -rect.height() * 0.18),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    left,
+                    left + egui::vec2(rect.width() * 0.22, rect.height() * 0.18),
+                ],
+                stroke,
+            );
+        }
+        ActionIcon::Share => {
+            let box_top = rect.top() + rect.height() * 0.50;
+            let box_rect = egui::Rect::from_min_max(
+                egui::pos2(rect.left() + rect.width() * 0.16, box_top),
+                egui::pos2(
+                    rect.right() - rect.width() * 0.16,
+                    rect.bottom() - rect.height() * 0.08,
+                ),
+            );
+            painter.line_segment([box_rect.left_top(), box_rect.left_bottom()], stroke);
+            painter.line_segment([box_rect.left_bottom(), box_rect.right_bottom()], stroke);
+            painter.line_segment([box_rect.right_bottom(), box_rect.right_top()], stroke);
+
+            let arrow_top = egui::pos2(rect.center().x, rect.top() + rect.height() * 0.08);
+            let arrow_bottom = egui::pos2(rect.center().x, rect.bottom() - rect.height() * 0.28);
+            painter.line_segment([arrow_bottom, arrow_top], stroke);
+            painter.line_segment(
+                [
+                    arrow_top,
+                    arrow_top + egui::vec2(-rect.width() * 0.18, rect.height() * 0.20),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    arrow_top,
+                    arrow_top + egui::vec2(rect.width() * 0.18, rect.height() * 0.20),
+                ],
+                stroke,
+            );
+        }
+    }
+}
+
+fn show_item_action_button(
+    ui: &mut egui::Ui,
+    ctx: &egui::Context,
+    textures: &mut std::collections::HashMap<Uuid, TextureHandle>,
+    data_dir: &Path,
+    item: &ClipItem,
+    theme: ThemeMode,
+) -> egui::Response {
+    let size = action_tile_size(item);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    ui.painter()
+        .rect_filled(rect, CornerRadius::same(7), thumbnail_background(theme));
+    ui.painter().rect_stroke(
+        rect,
+        CornerRadius::same(7),
+        Stroke::new(1.0, muted_text(theme)),
+        egui::StrokeKind::Inside,
+    );
+
+    if let Some(image) = &item.image {
+        if !textures.contains_key(&item.id) {
+            if let Ok(color_image) = load_color_image(&data_dir.join(&image.path)) {
+                let texture = ctx.load_texture(
+                    item.id.to_string(),
+                    color_image,
+                    egui::TextureOptions::LINEAR,
+                );
+                textures.insert(item.id, texture);
+            }
+        }
+
+        if let Some(texture) = textures.get(&item.id) {
+            let target = image_fit_rect(rect.shrink(3.0), image.width, image.height);
+            ui.painter().image(
+                texture.id(),
+                target,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                Color32::WHITE,
+            );
+            return response.on_hover_text("Preview image");
+        }
+    }
+
+    // Codes get their own tile: the code itself, readable at a glance.
+    if item.kind == ClipKind::OneTimeCode {
+        let code = item.text.as_deref().unwrap_or_default().trim();
+        if code.chars().count() <= 8 {
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                code,
+                egui::FontId::monospace(13.0),
+                ui.visuals().strong_text_color(),
+            );
+            return response.on_hover_text("One-time code: click to copy");
+        }
+    }
+
+    let icon = match item.kind {
+        ClipKind::Text | ClipKind::OneTimeCode => ActionIcon::Copy,
+        ClipKind::Url => ActionIcon::Open,
+        ClipKind::FilePath => ActionIcon::Finder,
+        ClipKind::Email => ActionIcon::Email,
+        ClipKind::Phone => ActionIcon::Phone,
+        ClipKind::Image => ActionIcon::Preview,
+        ClipKind::Files => ActionIcon::Finder,
+    };
+    let hover_text = match item.kind {
+        ClipKind::Text | ClipKind::OneTimeCode => "Copy text to clipboard",
+        ClipKind::Url => "Open URL",
+        ClipKind::FilePath => "Reveal in Finder",
+        ClipKind::Email => "Compose email",
+        ClipKind::Phone => "Open phone handler",
+        ClipKind::Image => "Preview image",
+        ClipKind::Files => "Reveal in Finder",
+    };
+    draw_action_icon(
+        ui.painter(),
+        rect.shrink(13.0),
+        icon,
+        muted_text(theme),
+        1.8,
+    );
+    response.on_hover_text(hover_text)
+}
+
+fn action_tile_size(item: &ClipItem) -> egui::Vec2 {
+    if item.kind == ClipKind::Image {
+        egui::vec2(ROW_HEIGHT, ROW_HEIGHT)
+    } else {
+        egui::vec2(THUMBNAIL_SIZE, THUMBNAIL_SIZE)
+    }
+}
+
+fn image_fit_rect(bounds: egui::Rect, width: usize, height: usize) -> egui::Rect {
+    if width == 0 || height == 0 {
+        return bounds;
+    }
+
+    let image_aspect = width as f32 / height as f32;
+    let bounds_aspect = bounds.width() / bounds.height();
+    let size = if image_aspect > bounds_aspect {
+        egui::vec2(bounds.width(), bounds.width() / image_aspect)
+    } else {
+        egui::vec2(bounds.height() * image_aspect, bounds.height())
+    };
+
+    egui::Rect::from_center_size(bounds.center(), size)
+}
+
+fn load_color_image(path: &Path) -> Result<egui::ColorImage> {
+    let image = ImageReader::open(path)
+        .context("open image")?
+        .decode()
+        .context("decode image")?
+        .to_rgba8();
+    let size = [image.width() as usize, image.height() as usize];
+    Ok(egui::ColorImage::from_rgba_unmultiplied(
+        size,
+        image.as_raw(),
+    ))
+}
+
+/// Records an item pushed through the local API and places it on the clipboard.
+/// The item goes in first, so the watcher sees it at the top and skips the echo.
+fn ingest_clip(store: &Mutex<HistoryStore>, request: &IngestRequest) -> Result<Uuid> {
+    let item = ClipItem::from_ingest(request);
+    let id = item.id;
+    store
+        .lock()
+        .map_err(|_| anyhow::anyhow!("history is unavailable"))?
+        .insert_item(item)
+        .context("save item to history")?;
+
+    let written = Clipboard::new()
+        .and_then(|mut clipboard| clipboard.set_text(request.text.clone()))
+        .context("set clipboard text");
+    if let Err(err) = written {
+        if let Ok(mut store) = store.lock() {
+            let _ = store.remove(id);
+        }
+        return Err(err);
+    }
+    Ok(id)
+}
+
+fn notification_text(request: &IngestRequest) -> (String, String) {
+    const TITLE_CHARS: usize = 60;
+    let preview = request
+        .text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let preview = if preview.chars().count() > TITLE_CHARS {
+        format!("{}…", preview.chars().take(TITLE_CHARS).collect::<String>())
+    } else {
+        preview
+    };
+    let title = format!("{preview} · copied to clipboard");
+    let body = match &request.label {
+        Some(label) => format!("{label} (from {})", request.source),
+        None => format!("From {}", request.source),
+    };
+    (title, body)
+}
+
+fn copy_item_to_clipboard(item: &ClipItem, data_dir: &Path) -> Result<()> {
+    match item.kind {
+        ClipKind::Text
+        | ClipKind::Url
+        | ClipKind::FilePath
+        | ClipKind::Email
+        | ClipKind::Phone
+        | ClipKind::OneTimeCode => {
+            let mut clipboard = Clipboard::new().context("open clipboard")?;
+            let text = item.text.as_deref().context("missing text payload")?;
+            clipboard
+                .set_text(text.to_owned())
+                .context("set clipboard text")?;
+        }
+        ClipKind::Image => {
+            let mut clipboard = Clipboard::new().context("open clipboard")?;
+            let image = item.image.as_ref().context("missing image payload")?;
+            let rgba = ImageReader::open(data_dir.join(&image.path))
+                .context("open stored image")?
+                .decode()
+                .context("decode stored image")?
+                .to_rgba8();
+            clipboard
+                .set_image(ImageData {
+                    width: rgba.width() as usize,
+                    height: rgba.height() as usize,
+                    bytes: Cow::Owned(rgba.into_raw()),
+                })
+                .context("set clipboard image")?;
+        }
+        ClipKind::Files => {
+            write_file_urls_to_clipboard(&item.files)?;
+        }
+    }
+    Ok(())
+}
+
+fn write_file_urls_to_clipboard(paths: &[PathBuf]) -> Result<()> {
+    let objects = file_pasteboard_objects(paths)?;
+    let pasteboard = NSPasteboard::generalPasteboard();
+    pasteboard.clearContents();
+    if pasteboard.writeObjects(&objects) {
+        Ok(())
+    } else {
+        anyhow::bail!("NSPasteboard refused file URLs")
+    }
+}
+
+fn file_pasteboard_objects(
+    paths: &[PathBuf],
+) -> Result<Retained<NSArray<ProtocolObject<dyn NSPasteboardWriting>>>> {
+    let urls = paths
+        .iter()
+        .filter_map(|path| {
+            let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+            NSURL::from_file_path(canonical).map(ProtocolObject::from_retained)
+        })
+        .collect::<Vec<Retained<ProtocolObject<dyn NSPasteboardWriting>>>>();
+
+    if urls.is_empty() {
+        anyhow::bail!("missing file payload")
+    }
+
+    Ok(NSArray::from_retained_slice(&urls))
+}
+
+fn open_share_sheet(item: &ClipItem, data_dir: &Path) -> Result<Retained<NSSharingServicePicker>> {
+    let share_items = share_items_for_clip(item, data_dir)?;
+    if share_items.is_empty() {
+        anyhow::bail!("missing share payload");
+    }
+
+    let items = NSArray::from_retained_slice(&share_items);
+    let picker =
+        unsafe { NSSharingServicePicker::initWithItems(NSSharingServicePicker::alloc(), &items) };
+    let mtm = MainThreadMarker::new().context("share sheet must run on the main thread")?;
+    let app = NSApplication::sharedApplication(mtm);
+    let window = app
+        .keyWindow()
+        .or_else(|| app.mainWindow())
+        .context("share sheet anchor window unavailable")?;
+    let view = window
+        .contentView()
+        .context("share sheet anchor view unavailable")?;
+    let frame = view.frame();
+    let anchor = NSRect::new(
+        NSPoint::new(frame.size.width * 0.5, frame.size.height * 0.25),
+        NSSize::new(1.0, 1.0),
+    );
+    picker.showRelativeToRect_ofView_preferredEdge(anchor, &view, NSRectEdge::MaxY);
+
+    Ok(picker)
+}
+
+fn share_items_for_clip(item: &ClipItem, data_dir: &Path) -> Result<Vec<Retained<AnyObject>>> {
+    match item.kind {
+        ClipKind::Text | ClipKind::Email | ClipKind::Phone | ClipKind::OneTimeCode => {
+            let text = item.text.as_deref().context("missing text payload")?;
+            Ok(vec![retained_as_any(NSString::from_str(text))])
+        }
+        ClipKind::Url => {
+            let text = item.text.as_deref().context("missing URL payload")?;
+            let url = share_url_from_text(text)
+                .unwrap_or_else(|| retained_as_any(NSString::from_str(text)));
+            Ok(vec![url])
+        }
+        ClipKind::FilePath => {
+            let paths = file_paths_for_item(item);
+            share_file_urls(&paths)
+        }
+        ClipKind::Files => share_file_urls(&item.files),
+        ClipKind::Image => {
+            let image = item.image.as_ref().context("missing image payload")?;
+            share_file_urls(&[data_dir.join(&image.path)])
+        }
+    }
+}
+
+fn share_url_from_text(value: &str) -> Option<Retained<AnyObject>> {
+    let string = NSString::from_str(value.trim());
+    NSURL::URLWithString(&string).map(retained_as_any)
+}
+
+fn share_file_urls(paths: &[PathBuf]) -> Result<Vec<Retained<AnyObject>>> {
+    let items = paths
+        .iter()
+        .filter_map(|path| {
+            let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+            NSURL::from_file_path(canonical).map(retained_as_any)
+        })
+        .collect::<Vec<_>>();
+
+    if items.is_empty() {
+        anyhow::bail!("missing file payload")
+    }
+
+    Ok(items)
+}
+
+fn retained_as_any<T: Message>(object: Retained<T>) -> Retained<AnyObject> {
+    unsafe { Retained::cast_unchecked(object) }
+}
+
+fn frontmost_application_pid() -> Option<i32> {
+    let app = NSWorkspace::sharedWorkspace().frontmostApplication()?;
+    let pid = app.processIdentifier();
+    let current_pid = NSRunningApplication::currentApplication().processIdentifier();
+    if pid <= 0 || pid == current_pid {
+        None
+    } else {
+        Some(pid)
+    }
+}
+
+fn activate_application(pid: i32) -> bool {
+    let Some(app) = NSRunningApplication::runningApplicationWithProcessIdentifier(pid) else {
+        return false;
+    };
+    if app.isTerminated() {
+        return false;
+    }
+    let _ = app.unhide();
+    app.activateWithOptions(NSApplicationActivationOptions::ActivateAllWindows)
+}
+
+fn paste_current_clipboard(target_pid: Option<i32>) -> Result<()> {
+    const KEY_V: u16 = 9;
+
+    if let Some(pid) = target_pid {
+        let _ = activate_application(pid);
+        thread::sleep(Duration::from_millis(120));
+    }
+
+    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+        .map_err(|_| anyhow::anyhow!("create keyboard event source"))?;
+    let key_down = CGEvent::new_keyboard_event(source.clone(), KEY_V, true)
+        .map_err(|_| anyhow::anyhow!("create paste key down event"))?;
+    let key_up = CGEvent::new_keyboard_event(source, KEY_V, false)
+        .map_err(|_| anyhow::anyhow!("create paste key up event"))?;
+
+    key_down.set_flags(CGEventFlags::CGEventFlagCommand);
+    key_up.set_flags(CGEventFlags::CGEventFlagCommand);
+    if let Some(pid) = target_pid {
+        key_down.post_to_pid(pid);
+        key_up.post_to_pid(pid);
+    } else {
+        key_down.post(CGEventTapLocation::HID);
+        key_up.post(CGEventTapLocation::HID);
+    }
+    Ok(())
+}
+
+fn accessibility_permission_granted() -> bool {
+    unsafe { AXIsProcessTrusted() }
+}
+
+fn request_accessibility_permission() -> bool {
+    let key = CFString::from_static_string("AXTrustedCheckOptionPrompt");
+    let value = CFBoolean::true_value();
+    let options = CFDictionary::from_CFType_pairs(&[(key, value)]);
+    unsafe { AXIsProcessTrustedWithOptions(options.as_concrete_TypeRef()) }
+}
+
+fn launch_agent_enabled() -> bool {
+    launch_agent_path().is_some_and(|path| path.exists())
+}
+
+fn set_launch_agent_enabled(enabled: bool) -> Result<()> {
+    let path = launch_agent_path().context("resolve LaunchAgents path")?;
+    if enabled {
+        let parent = path.parent().context("resolve LaunchAgents directory")?;
+        fs::create_dir_all(parent).context("create LaunchAgents directory")?;
+        let executable = env::current_exe().context("resolve current executable")?;
+        let plist = launch_agent_plist(&executable);
+        fs::write(&path, plist).context("write LaunchAgent plist")?;
+    } else if path.exists() {
+        fs::remove_file(&path).context("remove LaunchAgent plist")?;
+    }
+    Ok(())
+}
+
+fn launch_agent_path() -> Option<PathBuf> {
+    let home = env::var_os("HOME")?;
+    Some(
+        PathBuf::from(home)
+            .join("Library")
+            .join("LaunchAgents")
+            .join(format!("{LAUNCH_AGENT_LABEL}.plist")),
+    )
+}
+
+fn launch_agent_plist(executable: &Path) -> String {
+    let executable = xml_escape(&executable.to_string_lossy());
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{LAUNCH_AGENT_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{executable}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>
+"#
+    )
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn normalize_loaded_item(item: &mut ClipItem) -> bool {
+    if item.kind == ClipKind::OneTimeCode {
+        return false;
+    }
+    if let Some(text) = item.text.as_deref() {
+        let kind = classify_text(text);
+        let summary = summary_for_text(text);
+        let changed = item.kind != kind || item.summary != summary;
+        item.kind = kind;
+        item.summary = summary;
+        return changed;
+    }
+
+    if item.image.is_some() && item.kind != ClipKind::Image {
+        item.kind = ClipKind::Image;
+        return true;
+    }
+
+    if !item.files.is_empty() {
+        let summary = summary_for_files(&item.files);
+        let changed = item.kind != ClipKind::Files || item.summary != summary;
+        item.kind = ClipKind::Files;
+        item.summary = summary;
+        return changed;
+    }
+
+    false
+}
+
+fn summary_for_text(text: &str) -> String {
+    summarize_text(&mask_sensitive_text(text))
+}
+
+fn summary_for_files(paths: &[PathBuf]) -> String {
+    match paths {
+        [] => "No files".to_owned(),
+        [path] => path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_owned)
+            .unwrap_or_else(|| path.display().to_string()),
+        [first, rest @ ..] => {
+            let name = first
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+                .unwrap_or_else(|| first.display().to_string());
+            format!("{name} + {} more", rest.len())
+        }
+    }
+}
+
+fn classify_text(text: &str) -> ClipKind {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return ClipKind::Text;
+    }
+
+    if file_path_from_text(trimmed).is_some() {
+        ClipKind::FilePath
+    } else if Url::parse(trimmed).is_ok() {
+        ClipKind::Url
+    } else if is_email_address(trimmed) {
+        ClipKind::Email
+    } else if is_phone_number(trimmed) {
+        ClipKind::Phone
+    } else {
+        ClipKind::Text
+    }
+}
+
+fn file_path_from_text(text: &str) -> Option<PathBuf> {
+    let trimmed = strip_wrapping_quotes(text.trim());
+    if trimmed.is_empty() || trimmed.contains('\n') || trimmed.contains('\r') {
+        return None;
+    }
+
+    if let Ok(url) = Url::parse(trimmed) {
+        if url.scheme() == "file" {
+            let path = url.to_file_path().ok()?;
+            return path.exists().then_some(path);
+        }
+    }
+
+    let path = if trimmed == "~" {
+        PathBuf::from(env::var_os("HOME")?)
+    } else if let Some(rest) = trimmed.strip_prefix("~/") {
+        PathBuf::from(env::var_os("HOME")?).join(rest)
+    } else {
+        PathBuf::from(trimmed)
+    };
+
+    let candidate = if path.is_absolute() {
+        path
+    } else if trimmed.starts_with("./") || trimmed.starts_with("../") {
+        env::current_dir().ok()?.join(path)
+    } else {
+        return None;
+    };
+
+    candidate.exists().then_some(candidate)
+}
+
+fn file_paths_for_item(item: &ClipItem) -> Vec<PathBuf> {
+    if item.kind == ClipKind::Files {
+        return item.files.clone();
+    }
+
+    item.text
+        .as_deref()
+        .and_then(file_path_from_text)
+        .into_iter()
+        .collect()
+}
+
+fn strip_wrapping_quotes(value: &str) -> &str {
+    if value.len() < 2 {
+        return value;
+    }
+
+    let quoted = (value.starts_with('"') && value.ends_with('"'))
+        || (value.starts_with('\'') && value.ends_with('\''));
+    if quoted {
+        &value[1..value.len() - 1]
+    } else {
+        value
+    }
+}
+
+fn is_email_address(value: &str) -> bool {
+    if value.contains(char::is_whitespace) {
+        return false;
+    }
+
+    let Some((local, domain)) = value.split_once('@') else {
+        return false;
+    };
+    if local.is_empty()
+        || domain.is_empty()
+        || domain.starts_with('.')
+        || domain.ends_with('.')
+        || !domain.contains('.')
+    {
+        return false;
+    }
+
+    let local_ok = local
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '%' | '+' | '-'));
+    let domain_ok = domain
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-'));
+    local_ok && domain_ok
+}
+
+fn is_phone_number(value: &str) -> bool {
+    if contains_luhn_card_number(value) || value.contains('\n') || value.contains('\r') {
+        return false;
+    }
+
+    let mut digits = 0;
+    let mut seen_plus = false;
+    for (index, ch) in value.trim().chars().enumerate() {
+        if ch.is_ascii_digit() {
+            digits += 1;
+        } else if ch == '+' {
+            if index != 0 || seen_plus {
+                return false;
+            }
+            seen_plus = true;
+        } else if !matches!(ch, ' ' | '-' | '.' | '(' | ')') {
+            return false;
+        }
+    }
+
+    (7..=15).contains(&digits)
+}
+
+fn phone_url(value: &str) -> Option<String> {
+    if !is_phone_number(value) {
+        return None;
+    }
+
+    let mut phone = String::new();
+    for ch in value.trim().chars() {
+        if ch.is_ascii_digit() || (ch == '+' && phone.is_empty()) {
+            phone.push(ch);
+        }
+    }
+    Some(format!("tel:{phone}"))
+}
+
+fn mask_sensitive_text(text: &str) -> String {
+    mask_api_tokens(&mask_credit_card_numbers(text))
+}
+
+fn mask_credit_card_numbers(text: &str) -> String {
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let mut result = String::new();
+    let mut last = 0;
+    let mut index = 0;
+
+    while index < chars.len() {
+        let (start, ch) = chars[index];
+        if !ch.is_ascii_digit() {
+            index += 1;
+            continue;
+        }
+
+        let mut scan = index;
+        let mut end = start + ch.len_utf8();
+        let mut digits = String::new();
+        while scan < chars.len() {
+            let (byte_index, scan_ch) = chars[scan];
+            if scan_ch.is_ascii_digit() {
+                digits.push(scan_ch);
+                end = byte_index + scan_ch.len_utf8();
+                scan += 1;
+            } else if matches!(scan_ch, ' ' | '-')
+                && !digits.is_empty()
+                && chars
+                    .get(scan + 1)
+                    .is_some_and(|(_, next)| next.is_ascii_digit())
+            {
+                end = byte_index + scan_ch.len_utf8();
+                scan += 1;
+            } else {
+                break;
+            }
+
+            if digits.len() > 19 {
+                break;
+            }
+        }
+
+        if (13..=19).contains(&digits.len()) && luhn_valid(&digits) {
+            result.push_str(&text[last..start]);
+            result.push_str(&mask_card_number(&digits));
+            last = end;
+            index = scan;
+        } else {
+            index += 1;
+        }
+    }
+
+    result.push_str(&text[last..]);
+    result
+}
+
+fn contains_luhn_card_number(text: &str) -> bool {
+    mask_credit_card_numbers(text) != text
+}
+
+fn luhn_valid(digits: &str) -> bool {
+    let mut chars = digits.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if chars.all(|ch| ch == first) {
+        return false;
+    }
+
+    let mut sum = 0;
+    let mut double = false;
+    for ch in digits.chars().rev() {
+        let Some(mut digit) = ch.to_digit(10) else {
+            return false;
+        };
+        if double {
+            digit *= 2;
+            if digit > 9 {
+                digit -= 9;
+            }
+        }
+        sum += digit;
+        double = !double;
+    }
+
+    sum % 10 == 0
+}
+
+fn mask_card_number(digits: &str) -> String {
+    let last_four = last_chars(digits, 4);
+    format!("•••• •••• •••• {last_four}")
+}
+
+fn mask_api_tokens(text: &str) -> String {
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let mut result = String::new();
+    let mut last = 0;
+    let mut index = 0;
+
+    while index < chars.len() {
+        let (start, ch) = chars[index];
+        if !is_secret_token_char(ch) {
+            index += 1;
+            continue;
+        }
+
+        let mut scan = index;
+        let mut end = start + ch.len_utf8();
+        while scan < chars.len() {
+            let (byte_index, scan_ch) = chars[scan];
+            if is_secret_token_char(scan_ch) {
+                end = byte_index + scan_ch.len_utf8();
+                scan += 1;
+            } else {
+                break;
+            }
+        }
+
+        let token = &text[start..end];
+        if let Some(masked) = mask_api_token(token, sensitive_context_before(text, start)) {
+            result.push_str(&text[last..start]);
+            result.push_str(&masked);
+            last = end;
+        }
+        index = scan;
+    }
+
+    result.push_str(&text[last..]);
+    result
+}
+
+fn is_secret_token_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_')
+}
+
+fn mask_api_token(token: &str, sensitive_context: bool) -> Option<String> {
+    const PREFIXES: &[&str] = &[
+        "sk-proj-",
+        "sk-",
+        "ghp_",
+        "github_pat_",
+        "AKIA",
+        "xoxb-",
+        "xoxp-",
+        "AIza",
+    ];
+
+    if let Some(prefix) = PREFIXES
+        .iter()
+        .copied()
+        .find(|prefix| token.starts_with(prefix) && token.len() >= prefix.len() + 4)
+    {
+        return Some(format!("{prefix}...{}", last_chars(token, 4)));
+    }
+
+    if sensitive_context && looks_like_secret_value(token) {
+        return Some(format!("••••{}", last_chars(token, 4)));
+    }
+
+    if token.len() >= 20 && looks_like_secret_value(token) {
+        return Some(format!("{}...{}", &token[..4], last_chars(token, 4)));
+    }
+
+    None
+}
+
+fn sensitive_context_before(text: &str, start: usize) -> bool {
+    let context: String = text[..start]
+        .chars()
+        .rev()
+        .take(48)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>()
+        .to_ascii_lowercase();
+
+    [
+        "api_key",
+        "apikey",
+        "access_key",
+        "secret",
+        "token",
+        "password",
+        "passwd",
+        "credential",
+    ]
+    .iter()
+    .any(|label| context.contains(label))
+}
+
+fn looks_like_secret_value(token: &str) -> bool {
+    if token.len() < 20 {
+        return false;
+    }
+
+    let has_alpha = token.chars().any(|ch| ch.is_ascii_alphabetic());
+    let has_digit = token.chars().any(|ch| ch.is_ascii_digit());
+    has_alpha && has_digit
+}
+
+fn last_chars(value: &str, count: usize) -> String {
+    let mut chars = value.chars().rev().take(count).collect::<Vec<_>>();
+    chars.reverse();
+    chars.into_iter().collect()
+}
+
+fn summarize_text(text: &str) -> String {
+    const LIMIT: usize = 180;
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= LIMIT {
+        compact
+    } else {
+        let mut summary = compact.chars().take(LIMIT).collect::<String>();
+        summary.push_str("...");
+        summary
+    }
+}
+
+fn default_data_dir() -> PathBuf {
+    ProjectDirs::from("com", "mgosal", APP_NAME)
+        .map(|dirs| dirs.data_local_dir().to_path_buf())
+        .unwrap_or_else(|| PathBuf::from(".better-clipboard"))
+}
+
+fn history_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("history.json")
+}
+
+fn settings_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("settings.json")
+}
+
+fn images_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("images")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_history_keeps_multiple_distinct_items() {
+        let data_dir =
+            std::env::temp_dir().join(format!("better-clipboard-test-{}", Uuid::new_v4()));
+        let mut store = HistoryStore::new(data_dir.clone(), DEFAULT_HISTORY_LIMIT);
+
+        store
+            .push(text_snapshot("first copied item"))
+            .expect("push first item");
+        store
+            .push(text_snapshot("second copied item"))
+            .expect("push second item");
+
+        assert_eq!(store.items.len(), 2);
+        assert_eq!(store.items[0].text.as_deref(), Some("second copied item"));
+        assert_eq!(store.items[1].text.as_deref(), Some("first copied item"));
+
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn suppressed_copy_does_not_promote_existing_item() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "better-clipboard-suppressed-copy-test-{}",
+            Uuid::new_v4()
+        ));
+        let mut store = HistoryStore::new(data_dir.clone(), DEFAULT_HISTORY_LIMIT);
+
+        store.push(text_snapshot("first")).expect("push first item");
+        store
+            .push(text_snapshot("second"))
+            .expect("push second item");
+
+        let first_again = text_snapshot("first");
+        store.suppress_next_hash(first_again.hash());
+        store.push(first_again).expect("push suppressed item");
+
+        assert_eq!(store.items.len(), 2);
+        assert_eq!(store.items[0].text.as_deref(), Some("second"));
+        assert_eq!(store.items[1].text.as_deref(), Some("first"));
+        assert!(store.suppressed_hashes.is_empty());
+
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn classifies_common_text_payloads() {
+        assert_eq!(classify_text("https://example.com"), ClipKind::Url);
+        assert_eq!(classify_text("person@example.com"), ClipKind::Email);
+        assert_eq!(classify_text("+44 20 7946 0958"), ClipKind::Phone);
+    }
+
+    #[test]
+    fn classifies_existing_file_paths() {
+        let path = std::env::temp_dir().join(format!("better-clipboard-file-{}", Uuid::new_v4()));
+        fs::write(&path, "test").expect("write temp file");
+
+        assert_eq!(
+            classify_text(path.to_str().expect("utf-8 temp path")),
+            ClipKind::FilePath
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn parses_existing_file_urls() {
+        let path =
+            std::env::temp_dir().join(format!("better-clipboard-file-url-{}", Uuid::new_v4()));
+        fs::write(&path, "test").expect("write temp file");
+        let url = Url::from_file_path(&path).expect("file URL");
+
+        assert_eq!(
+            file_path_from_file_url_string(url.as_str()),
+            Some(path.clone())
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn file_history_items_keep_paths_without_copying_files() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "better-clipboard-file-history-test-{}",
+            Uuid::new_v4()
+        ));
+        let file_a = data_dir.join("first.txt");
+        let file_b = data_dir.join("second.txt");
+        fs::create_dir_all(&data_dir).expect("create temp dir");
+        fs::write(&file_a, "first").expect("write first file");
+        fs::write(&file_b, "second").expect("write second file");
+        let mut store = HistoryStore::new(data_dir.clone(), DEFAULT_HISTORY_LIMIT);
+
+        store
+            .push(file_snapshot(&[file_a.clone(), file_b.clone()]))
+            .expect("push file item");
+
+        assert_eq!(store.items.len(), 1);
+        assert_eq!(store.items[0].kind, ClipKind::Files);
+        assert_eq!(store.items[0].files, vec![file_a, file_b]);
+        assert_eq!(store.items[0].summary, "first.txt + 1 more");
+
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn masks_sensitive_display_values_without_changing_raw_text() {
+        let raw = "card 4111 1111 1111 1111 and key sk-proj-abcdefghijklmnopqrstuvwxyz123456";
+        let item = ClipItem::from_text(raw.to_owned(), "hash".to_owned());
+
+        assert_eq!(item.text.as_deref(), Some(raw));
+        assert!(item.summary.contains("•••• •••• •••• 1111"));
+        assert!(item.summary.contains("sk-proj-...3456"));
+        assert!(!item.summary.contains("4111 1111 1111 1111"));
+        assert!(!item.summary.contains("abcdefghijklmnopqrstuvwxyz"));
+    }
+
+    fn temp_store(name: &str) -> (HistoryStore, PathBuf) {
+        let data_dir =
+            std::env::temp_dir().join(format!("better-clipboard-{name}-{}", Uuid::new_v4()));
+        (
+            HistoryStore::new(data_dir.clone(), DEFAULT_HISTORY_LIMIT),
+            data_dir,
+        )
+    }
+
+    fn code_request(code: &str) -> IngestRequest {
+        IngestRequest {
+            text: code.to_owned(),
+            source: "Mail".to_owned(),
+            label: Some("Verification code".to_owned()),
+            kind: IngestKind::OneTimeCode,
+            notify: false,
+        }
+    }
+
+    #[test]
+    fn ingested_code_keeps_source_label_and_expiry() {
+        let item = ClipItem::from_ingest(&code_request("482913"));
+        assert_eq!(item.kind, ClipKind::OneTimeCode);
+        assert_eq!(item.text.as_deref(), Some("482913"));
+        assert_eq!(item.source.as_deref(), Some("Mail"));
+        assert_eq!(item.hash, text_snapshot("482913").hash());
+        assert!(item.expires_at.is_some());
+        assert_eq!(
+            item.metadata_line(),
+            format!(
+                "Code · from Mail · Verification code · {}",
+                item.created_at.format("%H:%M:%S")
+            )
+        );
+    }
+
+    #[test]
+    fn ingested_plain_text_is_classified() {
+        let mut request = code_request("https://example.com");
+        request.kind = IngestKind::Text;
+        let item = ClipItem::from_ingest(&request);
+        assert_eq!(item.kind, ClipKind::Url);
+        assert!(item.expires_at.is_none());
+    }
+
+    #[test]
+    fn clipboard_echo_of_ingested_item_is_not_duplicated() {
+        let (mut store, data_dir) = temp_store("ingest-echo");
+        store
+            .insert_item(ClipItem::from_ingest(&code_request("482913")))
+            .expect("insert code");
+        store.push(text_snapshot("482913")).expect("watcher echo");
+
+        assert_eq!(store.items.len(), 1);
+        assert_eq!(store.items[0].kind, ClipKind::OneTimeCode);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn one_time_code_is_superseded_by_next_clipboard_change() {
+        let (mut store, data_dir) = temp_store("code-superseded");
+        store.push(text_snapshot("older")).expect("push older");
+        store
+            .insert_item(ClipItem::from_ingest(&code_request("482913")))
+            .expect("insert code");
+        store.push(text_snapshot("newer")).expect("push newer");
+
+        let texts: Vec<_> = store
+            .items
+            .iter()
+            .filter_map(|i| i.text.as_deref())
+            .collect();
+        assert_eq!(texts, vec!["newer", "older"]);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn one_time_code_is_superseded_when_another_item_is_copied() {
+        let (mut store, data_dir) = temp_store("code-promote");
+        store.push(text_snapshot("older")).expect("push older");
+        store
+            .insert_item(ClipItem::from_ingest(&code_request("482913")))
+            .expect("insert code");
+        let code_id = store.items[0].id;
+        let older_id = store.items[1].id;
+
+        store.promote(code_id).expect("promote code itself");
+        assert_eq!(store.items.len(), 2);
+
+        store.promote(older_id).expect("promote older");
+        assert_eq!(store.items.len(), 1);
+        assert_eq!(store.items[0].id, older_id);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn expired_items_are_removed() {
+        let (mut store, data_dir) = temp_store("code-expiry");
+        store.push(text_snapshot("keep me")).expect("push text");
+        store
+            .insert_item(ClipItem::from_ingest(&code_request("482913")))
+            .expect("insert code");
+
+        store.remove_expired(Local::now()).expect("not yet expired");
+        assert_eq!(store.items.len(), 2);
+
+        store
+            .remove_expired(Local::now() + ONE_TIME_CODE_TTL + TimeDelta::seconds(1))
+            .expect("expire");
+        assert_eq!(store.items.len(), 1);
+        assert_eq!(store.items[0].text.as_deref(), Some("keep me"));
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn loaded_one_time_codes_are_not_reclassified() {
+        let mut item = ClipItem::from_ingest(&code_request("482913"));
+        assert!(!normalize_loaded_item(&mut item));
+        assert_eq!(item.kind, ClipKind::OneTimeCode);
+    }
+
+    #[test]
+    fn starred_items_survive_pruning_and_recopy() {
+        let (mut store, data_dir) = temp_store("stars");
+        store.max_items = MIN_HISTORY_LIMIT;
+        store
+            .push(text_snapshot("favourite"))
+            .expect("push favourite");
+        let favourite = store.items[0].id;
+        assert!(store.toggle_star(favourite).expect("star"));
+
+        for index in 0..MIN_HISTORY_LIMIT * 2 {
+            store
+                .push(text_snapshot(&format!("filler {index}")))
+                .expect("push filler");
+        }
+        assert_eq!(store.items.len(), MIN_HISTORY_LIMIT + 1);
+        assert!(store.items.iter().any(|item| item.id == favourite));
+
+        store
+            .push(text_snapshot("favourite"))
+            .expect("copy favourite again");
+        assert!(store.items[0].starred);
+        assert_eq!(store.items[0].text.as_deref(), Some("favourite"));
+        assert_eq!(store.items.iter().filter(|item| item.starred).count(), 1);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn items_without_new_fields_still_load() {
+        let json = r#"[{"id":"6f1c2d3e-4b5a-4c6d-8e7f-001122334455","kind":"Text","summary":"hi","text":"hi","image":null,"created_at":"2026-01-01T10:00:00+00:00","hash":"abc"}]"#;
+        let items: Vec<ClipItem> = serde_json::from_str(json).expect("parse old history");
+        assert!(!items[0].starred);
+        assert!(items[0].source.is_none());
+    }
+
+    #[test]
+    fn shortcut_hints_follow_selection() {
+        let text = ClipItem::from_text("hello".to_owned(), "h".to_owned());
+        let keys: Vec<_> = shortcut_hints(Some(&text), false)
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        assert_eq!(keys, vec!["Enter", "C", "Space", "S", "8", "/", "Esc"]);
+
+        let mut url = ClipItem::from_text("https://example.com".to_owned(), "u".to_owned());
+        url.starred = true;
+        let hints = shortcut_hints(Some(&url), false);
+        assert!(hints.contains(&("O", "Open")));
+        assert!(hints.contains(&("8", "Unstar")));
+
+        let search = shortcut_hints(Some(&text), true);
+        assert_eq!(search[0], ("↑↓", "Select"));
+        assert_eq!(
+            shortcut_hints(None, false),
+            vec![("/", "Search"), ("Esc", "Close")]
+        );
+    }
+
+    #[test]
+    fn notification_text_names_code_and_source() {
+        let (title, body) = notification_text(&code_request("482913"));
+        assert_eq!(title, "482913 · copied to clipboard");
+        assert_eq!(body, "Verification code (from Mail)");
+    }
+
+    fn text_snapshot(text: &str) -> ClipboardSnapshot {
+        ClipboardSnapshot::Text {
+            text: text.to_owned(),
+            hash: text_hash(text),
+        }
+    }
+
+    fn file_snapshot(paths: &[PathBuf]) -> ClipboardSnapshot {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"files:");
+        for path in paths {
+            hasher.update(path.to_string_lossy().as_bytes());
+            hasher.update(b"\0");
+        }
+        ClipboardSnapshot::Files {
+            paths: paths.to_vec(),
+            hash: hasher.finalize().to_hex().to_string(),
+        }
+    }
+}
